@@ -1,3 +1,8 @@
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, Any, List, Dict
+import httpx
+
 app = FastAPI(
     title="Polymarket GPT API",
     version="2.0.0",
