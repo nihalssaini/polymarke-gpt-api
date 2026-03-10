@@ -1,12 +1,12 @@
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 import httpx
 import json
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="3.0.0",
+    version="4.0.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, and Data APIs"
 )
 
@@ -73,7 +73,6 @@ def extract_token_ids(m: Dict[str, Any]) -> List[str]:
                         if item.get(key):
                             token_ids.append(str(item[key]))
 
-    # de-dupe while preserving order
     seen = set()
     result = []
     for tid in token_ids:
@@ -81,15 +80,6 @@ def extract_token_ids(m: Dict[str, Any]) -> List[str]:
             seen.add(tid)
             result.append(tid)
     return result
-
-
-def text_blob(m: Dict[str, Any]) -> str:
-    return " ".join([
-        str(m.get("question", "")),
-        str(m.get("slug", "")),
-        str(m.get("category", "")),
-        str(m.get("description", "")),
-    ]).lower()
 
 
 def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -112,17 +102,13 @@ def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def sport_terms_for(sport: str) -> List[str]:
-    sport = sport.lower()
-    aliases = {
-        "nba": ["nba", "basketball", "warriors", "lakers", "celtics", "knicks", "nuggets", "thunder"],
-        "mls": ["mls", "soccer", "inter miami", "lafc", "messi"],
-        "nfl": ["nfl", "football", "super bowl", "chiefs", "eagles", "cowboys", "bills"],
-        "mlb": ["mlb", "baseball", "world series", "yankees", "dodgers", "mets", "braves"],
-        "nhl": ["nhl", "hockey", "stanley cup", "panthers", "rangers", "bruins", "oilers"],
-        "soccer": ["soccer", "football", "fifa", "uefa", "champions league", "world cup"],
-    }
-    return aliases.get(sport, [sport])
+def text_blob(m: Dict[str, Any]) -> str:
+    return " ".join([
+        str(m.get("question", "")),
+        str(m.get("slug", "")),
+        str(m.get("category", "")),
+        str(m.get("description", "")),
+    ]).lower()
 
 
 def liquidity_key(m: Dict[str, Any]) -> float:
@@ -137,6 +123,158 @@ def volume_key(m: Dict[str, Any]) -> float:
         return float(m.get("volume") or 0)
     except Exception:
         return 0.0
+
+
+def sport_terms_for(sport: str) -> List[str]:
+    sport = sport.lower()
+    aliases = {
+        "nba": ["nba", "basketball", "western conference", "eastern conference"],
+        "mls": ["mls", "soccer", "major league soccer"],
+        "nfl": ["nfl", "football", "super bowl"],
+        "mlb": ["mlb", "baseball", "world series"],
+        "nhl": ["nhl", "hockey", "stanley cup"],
+        "soccer": ["soccer", "football", "fifa", "uefa", "champions league", "world cup"],
+    }
+    return aliases.get(sport, [sport])
+
+
+TEAM_ALIASES = {
+    "lakers": ["lakers", "los angeles lakers", "la lakers"],
+    "timberwolves": ["timberwolves", "wolves", "minnesota timberwolves", "minnesota wolves"],
+    "celtics": ["celtics", "boston celtics"],
+    "knicks": ["knicks", "new york knicks"],
+    "warriors": ["warriors", "golden state warriors"],
+    "nuggets": ["nuggets", "denver nuggets"],
+    "thunder": ["thunder", "oklahoma city thunder", "okc thunder"],
+    "mavericks": ["mavericks", "dallas mavericks", "mavs"],
+    "bucks": ["bucks", "milwaukee bucks"],
+    "heat": ["heat", "miami heat"],
+    "sixers": ["76ers", "sixers", "philadelphia 76ers"],
+    "spurs": ["spurs", "san antonio spurs"],
+    "clippers": ["clippers", "la clippers", "los angeles clippers"],
+    "suns": ["suns", "phoenix suns"],
+    "bulls": ["bulls", "chicago bulls"],
+    "pistons": ["pistons", "detroit pistons"],
+    "grizzlies": ["grizzlies", "memphis grizzlies"],
+    "pelicans": ["pelicans", "new orleans pelicans"],
+    "panthers": ["panthers", "florida panthers"],
+    "bruins": ["bruins", "boston bruins"],
+    "rangers": ["rangers", "new york rangers"],
+    "oilers": ["oilers", "edmonton oilers"],
+}
+
+
+FUTURES_TERMS = [
+    "finals",
+    "championship",
+    "champion",
+    "stanley cup",
+    "super bowl",
+    "world series",
+    "conference finals",
+    "to win the 2026",
+    "to win the 2025",
+    "to win the nba finals",
+    "to win the stanley cup",
+    "season wins",
+    "title",
+    "mvp",
+]
+
+
+GAME_TERMS = [
+    "vs",
+    "v.",
+    "tonight",
+    "today",
+    "game",
+    "match",
+    "winner",
+    "moneyline",
+    "spread",
+    "over/under",
+]
+
+
+def aliases_for_team(name: str) -> List[str]:
+    key = name.lower().strip()
+    return TEAM_ALIASES.get(key, [key])
+
+
+def is_probable_futures_market(m: Dict[str, Any]) -> bool:
+    blob = text_blob(m)
+    return any(term in blob for term in FUTURES_TERMS)
+
+
+def is_probable_game_market(m: Dict[str, Any]) -> bool:
+    blob = text_blob(m)
+    return any(term in blob for term in GAME_TERMS) and not is_probable_futures_market(m)
+
+
+def score_general_market(m: Dict[str, Any], search: Optional[str], sport: Optional[str], category: str) -> float:
+    blob = text_blob(m)
+    score = 0.0
+
+    score += liquidity_key(m) / 100000.0
+    score += volume_key(m) / 100000.0
+
+    if search:
+        for term in search.lower().split():
+            if term in blob:
+                score += 4.0
+
+    if sport:
+        for term in sport_terms_for(sport):
+            if term in blob:
+                score += 3.0
+
+    if category.lower() == "sports":
+        if any(term in blob for term in ["nba", "nfl", "mlb", "nhl", "mls", "soccer", "basketball", "football", "baseball", "hockey"]):
+            score += 4.0
+
+    if is_probable_game_market(m):
+        score += 8.0
+
+    if is_probable_futures_market(m):
+        score -= 6.0
+
+    return score
+
+
+def score_game_market(m: Dict[str, Any], team1: str, team2: str, sport: Optional[str]) -> float:
+    blob = text_blob(m)
+    score = 0.0
+
+    team1_terms = aliases_for_team(team1)
+    team2_terms = aliases_for_team(team2)
+
+    team1_hits = sum(1 for t in team1_terms if t in blob)
+    team2_hits = sum(1 for t in team2_terms if t in blob)
+
+    score += team1_hits * 12.0
+    score += team2_hits * 12.0
+
+    if team1_hits > 0 and team2_hits > 0:
+        score += 30.0
+
+    if any(term in blob for term in ["vs", "v.", "winner", "moneyline", "spread", "game", "match", "tonight", "today"]):
+        score += 12.0
+
+    if is_probable_game_market(m):
+        score += 10.0
+
+    if is_probable_futures_market(m):
+        score -= 25.0
+
+    if sport:
+        for term in sport_terms_for(sport):
+            if term in blob:
+                score += 2.0
+
+    score += liquidity_key(m) / 100000.0
+    score += volume_key(m) / 100000.0
+
+    return score
 
 
 @app.get("/")
@@ -157,8 +295,31 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/categories")
+def categories():
+    return {
+        "categories": [
+            "all",
+            "sports",
+            "politics",
+            "crypto",
+            "news",
+            "current-events"
+        ],
+        "sports": [
+            "nba",
+            "mls",
+            "nfl",
+            "mlb",
+            "nhl",
+            "soccer",
+            "other"
+        ]
+    }
+
+
 # -------------------------
-# GAMMA: market discovery
+# GAMMA: discovery
 # -------------------------
 
 @app.get("/markets")
@@ -171,7 +332,7 @@ async def markets(
     raw = await fetch_json(
         GAMMA_BASE,
         "/markets",
-        params={"limit": 200, "active": "true", "closed": "false"}
+        params={"limit": 300, "active": "true", "closed": "false"}
     )
 
     if not isinstance(raw, list):
@@ -206,7 +367,13 @@ async def markets(
         else:
             markets_list = [m for m in markets_list if c in text_blob(m)]
 
-    cleaned = [normalize_market(m) for m in markets_list[:limit]]
+    ranked = sorted(
+        markets_list,
+        key=lambda m: score_general_market(m, search, sport, category),
+        reverse=True
+    )
+
+    cleaned = [normalize_market(m) for m in ranked[:limit]]
 
     return {
         "category": category,
@@ -220,11 +387,52 @@ async def markets(
 
 @app.get("/find-market")
 async def find_market(
-    query: str = Query(..., description="Natural-language query like 'lakers', 'stanley cup', 'bitcoin'"),
+    query: str = Query(..., description="Natural-language search like 'lakers', 'stanley cup', 'bitcoin'"),
+    sport: Optional[str] = Query(default=None),
     limit: int = Query(default=10, ge=1, le=50)
 ):
-    data = await markets(category="all", sport=None, search=query, limit=limit)
-    return data
+    return await markets(category="all", sport=sport, search=query, limit=limit)
+
+
+@app.get("/find-game")
+async def find_game(
+    team1: str = Query(..., description="First team, e.g. lakers"),
+    team2: str = Query(..., description="Second team, e.g. timberwolves"),
+    sport: str = Query(default="nba"),
+    limit: int = Query(default=10, ge=1, le=30)
+):
+    raw = await fetch_json(
+        GAMMA_BASE,
+        "/markets",
+        params={"limit": 300, "active": "true", "closed": "false"}
+    )
+
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=502, detail="Unexpected response format from Gamma API")
+
+    filtered = []
+    for m in raw:
+        score = score_game_market(m, team1, team2, sport)
+        if score > 0:
+            filtered.append((score, m))
+
+    filtered.sort(key=lambda x: x[0], reverse=True)
+
+    results = []
+    for score, market in filtered[:limit]:
+        item = normalize_market(market)
+        item["matchScore"] = round(score, 2)
+        item["isProbableGameMarket"] = is_probable_game_market(market)
+        item["isProbableFuturesMarket"] = is_probable_futures_market(market)
+        results.append(item)
+
+    return {
+        "team1": team1,
+        "team2": team2,
+        "sport": sport,
+        "count": len(results),
+        "markets": results
+    }
 
 
 @app.get("/market-details")
@@ -245,7 +453,7 @@ async def market_details(
     raw = await fetch_json(
         GAMMA_BASE,
         "/markets",
-        params={"limit": 200, "active": "true", "closed": "false"}
+        params={"limit": 300, "active": "true", "closed": "false"}
     )
     if not isinstance(raw, list):
         raise HTTPException(status_code=502, detail="Unexpected response format from Gamma API")
@@ -260,35 +468,61 @@ async def market_details(
     }
 
 
-@app.get("/categories")
-def categories():
+@app.get("/market-summary")
+async def market_summary(
+    query: Optional[str] = Query(default=None),
+    slug: Optional[str] = Query(default=None),
+    team1: Optional[str] = Query(default=None),
+    team2: Optional[str] = Query(default=None),
+    sport: Optional[str] = Query(default=None)
+):
+    chosen_market = None
+
+    if slug:
+        details = await market_details(slug=slug)
+        chosen_market = details["market"]
+
+    elif team1 and team2:
+        found = await find_game(team1=team1, team2=team2, sport=sport or "nba", limit=1)
+        if found["count"] == 0:
+            raise HTTPException(status_code=404, detail="No likely game market found")
+        chosen_market = found["markets"][0]
+
+    elif query:
+        found = await find_market(query=query, sport=sport, limit=1)
+        if found["count"] == 0:
+            raise HTTPException(status_code=404, detail="No market found")
+        chosen_market = found["markets"][0]
+
+    else:
+        raise HTTPException(status_code=400, detail="Provide slug, query, or team1/team2")
+
+    token_ids = chosen_market.get("tokenIds") or []
+    pricing = {}
+
+    if token_ids:
+        first_token = token_ids[0]
+        try:
+            pricing = {
+                "price": await fetch_json(CLOB_BASE, "/price", params={"token_id": first_token}),
+                "midpoint": await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": first_token}),
+                "spread": await fetch_json(CLOB_BASE, "/spread", params={"token_id": first_token}),
+            }
+        except Exception as e:
+            pricing = {"error": str(e)}
+
     return {
-        "categories": [
-            "all",
-            "sports",
-            "politics",
-            "crypto",
-            "news",
-            "current-events"
-        ],
-        "sports": [
-            "nba",
-            "mls",
-            "nfl",
-            "mlb",
-            "nhl",
-            "soccer",
-            "other"
-        ]
+        "market": chosen_market,
+        "pricing": pricing
     }
 
 
 # -------------------------
-# CLOB: pricing & orderbook
+# CLOB: pricing
 # -------------------------
 
 @app.get("/clob/price")
-async def clob_price(token_id: str = Query(..., description="CLOB token id")):
+async def clob_price(token_id: str = Query(...)):
     return await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id})
 
 
@@ -299,25 +533,25 @@ async def clob_prices(token_ids: str = Query(..., description="Comma-separated t
 
 
 @app.get("/clob/book")
-async def clob_book(token_id: str = Query(..., description="CLOB token id")):
+async def clob_book(token_id: str = Query(...)):
     return await fetch_json(CLOB_BASE, "/book", params={"token_id": token_id})
 
 
 @app.get("/clob/midpoint")
-async def clob_midpoint(token_id: str = Query(..., description="CLOB token id")):
+async def clob_midpoint(token_id: str = Query(...)):
     return await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
 
 
 @app.get("/clob/spread")
-async def clob_spread(token_id: str = Query(..., description="CLOB token id")):
+async def clob_spread(token_id: str = Query(...)):
     return await fetch_json(CLOB_BASE, "/spread", params={"token_id": token_id})
 
 
 @app.get("/clob/history")
 async def clob_history(
-    token_id: str = Query(..., description="CLOB token id"),
-    interval: str = Query(default="1d", description="History interval, e.g. max, 1w, 1d"),
-    fidelity: int = Query(default=60, description="Granularity / fidelity")
+    token_id: str = Query(...),
+    interval: str = Query(default="1d"),
+    fidelity: int = Query(default=60)
 ):
     return await fetch_json(
         CLOB_BASE,
@@ -331,7 +565,7 @@ async def clob_history(
 
 
 @app.get("/price-check")
-async def price_check(token_id: str = Query(..., description="CLOB token id")):
+async def price_check(token_id: str = Query(...)):
     price = await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id})
     midpoint = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
     spread = await fetch_json(CLOB_BASE, "/spread", params={"token_id": token_id})
@@ -345,13 +579,11 @@ async def price_check(token_id: str = Query(..., description="CLOB token id")):
 
 
 # -------------------------
-# DATA API: context / analytics
+# DATA API
 # -------------------------
 
 @app.get("/data/open-interest")
-async def data_open_interest(
-    market: Optional[str] = Query(default=None, description="0x-prefixed market identifier")
-):
+async def data_open_interest(market: Optional[str] = Query(default=None)):
     params = {}
     if market:
         params["market"] = market
@@ -360,7 +592,7 @@ async def data_open_interest(
 
 @app.get("/data/holders")
 async def data_holders(
-    market: Optional[str] = Query(default=None, description="0x-prefixed market identifier"),
+    market: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     minBalance: int = Query(default=1, ge=1)
 ):
@@ -372,7 +604,7 @@ async def data_holders(
 
 @app.get("/data/trades")
 async def data_trades(
-    market: Optional[str] = Query(default=None, description="0x-prefixed market identifier"),
+    market: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200)
 ):
     params = {"limit": limit}
@@ -382,9 +614,7 @@ async def data_trades(
 
 
 @app.get("/data/live-volume")
-async def data_live_volume(
-    event: Optional[str] = Query(default=None, description="Optional event identifier")
-):
+async def data_live_volume(event: Optional[str] = Query(default=None)):
     params = {}
     if event:
         params["event"] = event
@@ -392,7 +622,7 @@ async def data_live_volume(
 
 
 # -------------------------
-# Combined scanner
+# Scanner
 # -------------------------
 
 @app.get("/best-opportunities")
@@ -445,3 +675,4 @@ async def scan_market(
         "market": market,
         "clob": clob
     }
+
