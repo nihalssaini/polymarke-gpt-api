@@ -5,7 +5,7 @@ import httpx
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="2.0.0",
+    version="2.1.0",
     description="Read-only API for Polymarket trade analysis across sports, politics, crypto, and current events"
 )
 
@@ -28,9 +28,15 @@ async def fetch_gamma(path: str, params: Optional[dict] = None) -> Any:
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"Gamma API error: {e.response.text}")
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=f"Gamma API error: {e.response.text}"
+            )
         except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Request failed: {str(e)}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Request failed: {str(e)}"
+            )
 
 
 def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -51,6 +57,15 @@ def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def text_blob(m: Dict[str, Any]) -> str:
+    return " ".join([
+        str(m.get("question", "")),
+        str(m.get("slug", "")),
+        str(m.get("category", "")),
+        str(m.get("description", "")),
+    ]).lower()
+
+
 @app.get("/")
 def root():
     return {
@@ -66,13 +81,13 @@ def health():
 
 @app.get("/markets")
 async def markets(
-    category: str = Query(default="all", description="Category such as sports, politics, crypto, news, all"),
-    sport: Optional[str] = Query(default=None, description="Sport such as nba, mls, nfl, mlb"),
-    search: Optional[str] = Query(default=None, description="Search term for market title or event"),
-    limit: int = Query(default=20, ge=1, le=100, description="Maximum number of markets to return")
+    category: str = Query(default="all"),
+    sport: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100)
 ):
     params = {
-        "limit": limit,
+        "limit": 100,
         "active": "true",
         "closed": "false"
     }
@@ -82,33 +97,42 @@ async def markets(
     if not isinstance(raw, list):
         raise HTTPException(status_code=502, detail="Unexpected response format from Gamma API")
 
-    markets_list: List[Dict[str, Any]] = raw
-
-    # Filter locally because Gamma category/tag usage can vary by market structure.
-    if category and category.lower() != "all":
-        markets_list = [
-            m for m in markets_list
-            if str(m.get("category", "")).lower() == category.lower()
-               or category.lower() in str(m.get("question", "")).lower()
-        ]
-
-    if sport:
-        sport_lower = sport.lower()
-        markets_list = [
-            m for m in markets_list
-            if sport_lower in str(m.get("question", "")).lower()
-               or sport_lower in str(m.get("category", "")).lower()
-               or sport_lower in str(m.get("slug", "")).lower()
-        ]
+    markets_list = raw
 
     if search:
         s = search.lower()
+        markets_list = [m for m in markets_list if s in text_blob(m)]
+
+    if sport:
+        s = sport.lower()
+        sport_aliases = {
+            "nba": ["nba", "basketball", "warriors", "lakers", "celtics", "knicks", "nuggets"],
+            "mls": ["mls", "soccer", "inter miami"],
+            "nfl": ["nfl", "football", "super bowl"],
+            "mlb": ["mlb", "baseball", "world series"],
+            "nhl": ["nhl", "hockey", "stanley cup"]
+        }
+        terms = sport_aliases.get(s, [s])
         markets_list = [
             m for m in markets_list
-            if s in str(m.get("question", "")).lower()
-               or s in str(m.get("slug", "")).lower()
-               or s in str(m.get("category", "")).lower()
+            if any(term in text_blob(m) for term in terms)
         ]
+
+    if category and category.lower() != "all":
+        c = category.lower()
+
+        if c == "sports":
+            sports_terms = [
+                "nba", "nfl", "mlb", "nhl", "mls", "soccer",
+                "basketball", "football", "baseball", "hockey",
+                "champion", "match", "game", "playoff"
+            ]
+            markets_list = [
+                m for m in markets_list
+                if any(term in text_blob(m) for term in sports_terms)
+            ]
+        else:
+            markets_list = [m for m in markets_list if c in text_blob(m)]
 
     cleaned = [normalize_market(m) for m in markets_list[:limit]]
 
@@ -137,7 +161,6 @@ async def market_details(
             "market": normalize_market(raw)
         }
 
-    # slug lookup via list endpoint then filter
     raw = await fetch_gamma("/markets", params={"limit": 100, "active": "true", "closed": "false"})
     if not isinstance(raw, list):
         raise HTTPException(status_code=502, detail="Unexpected response format from Gamma API")
@@ -154,28 +177,37 @@ async def market_details(
 
 @app.get("/best-opportunities")
 async def best_opportunities(
-    category: str = Query(default="all", description="Category such as sports, politics, crypto, news, all"),
-    sport: Optional[str] = Query(default=None, description="Sport such as nba, mls, nfl, mlb"),
-    limit: int = Query(default=5, ge=1, le=20, description="Maximum number of opportunities to return")
+    category: str = Query(default="all"),
+    sport: Optional[str] = Query(default=None),
+    limit: int = Query(default=5, ge=1, le=20)
 ):
-    # For now this is a scanner, not a true edge model.
-    # It pulls live markets and returns the most liquid active ones for GPT-side analysis.
-    data = await markets(category=category, sport=sport, search=None, limit=min(limit * 5, 100))
+    data = await markets(category=category, sport=sport, search=None, limit=100)
     markets_list = data["markets"]
 
-    def liquidity_key(m: Dict[str, Any]) -> float:
+    def liquidity_key(m):
         try:
             return float(m.get("liquidity") or 0)
-        except (TypeError, ValueError):
+        except Exception:
             return 0.0
 
-    ranked = sorted(markets_list, key=liquidity_key, reverse=True)[:limit]
+    def volume_key(m):
+        try:
+            return float(m.get("volume") or 0)
+        except Exception:
+            return 0.0
+
+    ranked = sorted(
+        markets_list,
+        key=lambda m: (liquidity_key(m), volume_key(m)),
+        reverse=True
+    )[:limit]
 
     return {
         "category": category,
         "sport": sport,
         "limit": limit,
-        "message": "Top liquid active markets for GPT-side opportunity analysis",
+        "count": len(ranked),
+        "message": "Top active markets ranked by liquidity and volume for GPT-side analysis",
         "opportunities": ranked
     }
 
