@@ -6,8 +6,8 @@ import json
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.0.0",
-    description="Read-only API for Polymarket trade analysis using Gamma search, CLOB pricing, and Data API"
+    version="4.0.0",
+    description="Read-only API for Polymarket trade analysis using Gamma, CLOB, and Data APIs"
 )
 
 app.add_middleware(
@@ -23,6 +23,10 @@ CLOB_BASE = "https://clob.polymarket.com"
 DATA_BASE = "https://data-api.polymarket.com"
 
 
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
+
 async def fetch_json(base: str, path: str, params: Optional[dict] = None) -> Any:
     url = f"{base}{path}"
     async with httpx.AsyncClient(timeout=25.0) as client:
@@ -31,15 +35,10 @@ async def fetch_json(base: str, path: str, params: Optional[dict] = None) -> Any
             resp.raise_for_status()
             return resp.json()
         except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=e.response.status_code,
-                detail=f"Upstream API error from {url}: {e.response.text}"
-            )
+            raise HTTPException(status_code=e.response.status_code,
+                                detail=f"Upstream error from {url}: {e.response.text}")
         except httpx.RequestError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Request failed for {url}: {str(e)}"
-            )
+            raise HTTPException(status_code=502, detail=f"Request failed for {url}: {str(e)}")
 
 
 def parse_possible_json(value: Any) -> Any:
@@ -58,12 +57,9 @@ def extract_token_ids(m: Dict[str, Any]) -> List[str]:
         m.get("outcomeTokenIds"),
         m.get("tokens"),
     ]
-
     token_ids: List[str] = []
-
     for candidate in candidates:
         parsed = parse_possible_json(candidate)
-
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, str):
@@ -72,7 +68,6 @@ def extract_token_ids(m: Dict[str, Any]) -> List[str]:
                     for key in ["tokenId", "token_id", "id", "asset_id"]:
                         if item.get(key):
                             token_ids.append(str(item[key]))
-
     seen = set()
     result = []
     for tid in token_ids:
@@ -125,54 +120,6 @@ def volume_key(m: Dict[str, Any]) -> float:
         return 0.0
 
 
-TEAM_ALIASES = {
-    "lakers": ["lakers", "los angeles lakers", "la lakers"],
-    "timberwolves": ["timberwolves", "wolves", "minnesota timberwolves"],
-    "celtics": ["celtics", "boston celtics"],
-    "knicks": ["knicks", "new york knicks"],
-    "warriors": ["warriors", "golden state warriors"],
-    "nuggets": ["nuggets", "denver nuggets"],
-    "thunder": ["thunder", "oklahoma city thunder", "okc thunder"],
-    "mavericks": ["mavericks", "dallas mavericks", "mavs"],
-    "bucks": ["bucks", "milwaukee bucks"],
-    "heat": ["heat", "miami heat"],
-    "sixers": ["76ers", "sixers", "philadelphia 76ers"],
-    "spurs": ["spurs", "san antonio spurs"],
-    "clippers": ["clippers", "la clippers", "los angeles clippers"],
-    "suns": ["suns", "phoenix suns"],
-    "bulls": ["bulls", "chicago bulls"],
-    "pistons": ["pistons", "detroit pistons"],
-    "grizzlies": ["grizzlies", "memphis grizzlies"],
-    "pelicans": ["pelicans", "new orleans pelicans"],
-}
-
-FUTURES_TERMS = [
-    "finals", "championship", "champion", "stanley cup", "super bowl",
-    "world series", "conference finals", "title", "mvp", "to win the 2026",
-    "to win the nba finals", "season wins"
-]
-
-GAME_TERMS = [
-    "vs", "v.", "tonight", "today", "game", "match", "winner",
-    "moneyline", "spread", "over/under"
-]
-
-
-def aliases_for_team(name: str) -> List[str]:
-    key = name.lower().strip()
-    return TEAM_ALIASES.get(key, [key])
-
-
-def is_futures_market(m: Dict[str, Any]) -> bool:
-    blob = text_blob(m)
-    return any(term in blob for term in FUTURES_TERMS)
-
-
-def is_game_market(m: Dict[str, Any]) -> bool:
-    blob = text_blob(m)
-    return any(term in blob for term in GAME_TERMS) and not is_futures_market(m)
-
-
 def yes_price_from_market(m: Dict[str, Any]) -> Optional[float]:
     prices = parse_possible_json(m.get("outcomePrices"))
     if isinstance(prices, list) and prices:
@@ -194,12 +141,170 @@ def extreme_price_penalty(m: Dict[str, Any]) -> float:
     return 0.0
 
 
+TEAM_ALIASES: Dict[str, List[str]] = {
+    # NBA
+    "lakers": ["lakers", "los angeles lakers", "la lakers"],
+    "timberwolves": ["timberwolves", "wolves", "minnesota timberwolves"],
+    "celtics": ["celtics", "boston celtics"],
+    "knicks": ["knicks", "new york knicks"],
+    "warriors": ["warriors", "golden state warriors"],
+    "nuggets": ["nuggets", "denver nuggets"],
+    "thunder": ["thunder", "oklahoma city thunder", "okc thunder"],
+    "mavericks": ["mavericks", "dallas mavericks", "mavs"],
+    "bucks": ["bucks", "milwaukee bucks"],
+    "heat": ["heat", "miami heat"],
+    "sixers": ["76ers", "sixers", "philadelphia 76ers"],
+    "spurs": ["spurs", "san antonio spurs"],
+    "clippers": ["clippers", "la clippers", "los angeles clippers"],
+    "suns": ["suns", "phoenix suns"],
+    "bulls": ["bulls", "chicago bulls"],
+    "pistons": ["pistons", "detroit pistons"],
+    "grizzlies": ["grizzlies", "memphis grizzlies"],
+    "pelicans": ["pelicans", "new orleans pelicans"],
+    "pacers": ["pacers", "indiana pacers"],
+    "hawks": ["hawks", "atlanta hawks"],
+    "nets": ["nets", "brooklyn nets"],
+    "raptors": ["raptors", "toronto raptors"],
+    "magic": ["magic", "orlando magic"],
+    "cavaliers": ["cavaliers", "cavs", "cleveland cavaliers"],
+    "wizards": ["wizards", "washington wizards"],
+    "kings": ["kings", "sacramento kings"],
+    "jazz": ["jazz", "utah jazz"],
+    "rockets": ["rockets", "houston rockets"],
+    "trail blazers": ["trail blazers", "blazers", "portland trail blazers"],
+    "hornets": ["hornets", "charlotte hornets"],
+    # NFL
+    "chiefs": ["chiefs", "kansas city chiefs"],
+    "eagles": ["eagles", "philadelphia eagles"],
+    "patriots": ["patriots", "new england patriots"],
+    "cowboys": ["cowboys", "dallas cowboys"],
+    "49ers": ["49ers", "san francisco 49ers", "niners"],
+    "ravens": ["ravens", "baltimore ravens"],
+    "bills": ["bills", "buffalo bills"],
+    "bengals": ["bengals", "cincinnati bengals"],
+    "steelers": ["steelers", "pittsburgh steelers"],
+    "packers": ["packers", "green bay packers"],
+    "bears": ["bears", "chicago bears"],
+    "giants": ["giants", "new york giants"],
+    "jets": ["jets", "new york jets"],
+    "dolphins": ["dolphins", "miami dolphins"],
+    "broncos": ["broncos", "denver broncos"],
+    "raiders": ["raiders", "las vegas raiders"],
+    "chargers": ["chargers", "los angeles chargers"],
+    "seahawks": ["seahawks", "seattle seahawks"],
+    "rams": ["rams", "los angeles rams"],
+    "cardinals": ["cardinals", "arizona cardinals"],
+    "saints": ["saints", "new orleans saints"],
+    "buccaneers": ["buccaneers", "bucs", "tampa bay buccaneers"],
+    "falcons": ["falcons", "atlanta falcons"],
+    "panthers": ["panthers", "carolina panthers"],
+    "vikings": ["vikings", "minnesota vikings"],
+    "lions": ["lions", "detroit lions"],
+    "colts": ["colts", "indianapolis colts"],
+    "jaguars": ["jaguars", "jacksonville jaguars"],
+    "titans": ["titans", "tennessee titans"],
+    "texans": ["texans", "houston texans"],
+    "browns": ["browns", "cleveland browns"],
+    # MLB
+    "yankees": ["yankees", "new york yankees"],
+    "dodgers": ["dodgers", "los angeles dodgers"],
+    "red sox": ["red sox", "boston red sox"],
+    "cubs": ["cubs", "chicago cubs"],
+    "mets": ["mets", "new york mets"],
+    "braves": ["braves", "atlanta braves"],
+    "astros": ["astros", "houston astros"],
+    "giants sf": ["giants", "san francisco giants"],
+    "padres": ["padres", "san diego padres"],
+    "phillies": ["phillies", "philadelphia phillies"],
+    # NHL
+    "rangers": ["rangers", "new york rangers"],
+    "bruins": ["bruins", "boston bruins"],
+    "maple leafs": ["maple leafs", "toronto maple leafs", "leafs"],
+    "blackhawks": ["blackhawks", "chicago blackhawks"],
+    "penguins": ["penguins", "pittsburgh penguins"],
+    "capitals": ["capitals", "washington capitals", "caps"],
+    "lightning": ["lightning", "tampa bay lightning"],
+    "avalanche": ["avalanche", "colorado avalanche", "avs"],
+    "golden knights": ["golden knights", "vegas golden knights"],
+    "oilers": ["oilers", "edmonton oilers"],
+    "flames": ["flames", "calgary flames"],
+    "canucks": ["canucks", "vancouver canucks"],
+    # Soccer
+    "manchester city": ["manchester city", "man city"],
+    "arsenal": ["arsenal"],
+    "liverpool": ["liverpool"],
+    "chelsea": ["chelsea"],
+    "real madrid": ["real madrid"],
+    "barcelona": ["barcelona", "barca"],
+    "manchester united": ["manchester united", "man united", "man utd"],
+    "tottenham": ["tottenham", "spurs", "tottenham hotspur"],
+    "bayern munich": ["bayern munich", "bayern"],
+    "psg": ["psg", "paris saint-germain", "paris saint germain"],
+    "juventus": ["juventus", "juve"],
+    "inter milan": ["inter milan", "inter"],
+    "ac milan": ["ac milan", "milan"],
+    "atletico madrid": ["atletico madrid", "atletico"],
+    "dortmund": ["dortmund", "borussia dortmund", "bvb"],
+}
+
+FUTURES_TERMS = [
+    "finals", "championship", "champion", "stanley cup", "super bowl",
+    "world series", "conference finals", "title", "mvp", "to win the 2026",
+    "to win the nba finals", "season wins", "to win the", "most wins",
+    "win the nba", "win the nfl", "win the mlb", "win the nhl",
+    "reach the finals", "make the playoffs"
+]
+
+GAME_TERMS = [
+    "vs", "v.", "tonight", "today", "game", "match", "winner",
+    "moneyline", "spread", "over/under", "will win", "beat", "defeat"
+]
+
+SPORT_TERMS = {
+    "nba": ["nba", "basketball"],
+    "nfl": ["nfl", "football"],
+    "mlb": ["mlb", "baseball"],
+    "nhl": ["nhl", "hockey"],
+    "mls": ["mls", "soccer", "football"],
+    "soccer": ["soccer", "football", "epl", "champions league", "la liga", "serie a", "bundesliga"],
+}
+
+
+def aliases_for_team(name: str) -> List[str]:
+    key = name.lower().strip()
+    return TEAM_ALIASES.get(key, [key])
+
+
+def is_futures_market(m: Dict[str, Any]) -> bool:
+    blob = text_blob(m)
+    return any(term in blob for term in FUTURES_TERMS)
+
+
+def is_game_market(m: Dict[str, Any]) -> bool:
+    blob = text_blob(m)
+    return any(term in blob for term in GAME_TERMS) and not is_futures_market(m)
+
+
+def matches_sport(m: Dict[str, Any], sport: Optional[str]) -> bool:
+    if not sport or sport.lower() == "all":
+        return True
+    blob = text_blob(m)
+    terms = SPORT_TERMS.get(sport.lower(), [sport.lower()])
+    return any(t in blob for t in terms)
+
+
 def score_game_candidate(m: Dict[str, Any], team1: str, team2: str) -> float:
     blob = text_blob(m)
     score = 0.0
 
     team1_hits = sum(1 for t in aliases_for_team(team1) if t in blob)
     team2_hits = sum(1 for t in aliases_for_team(team2) if t in blob)
+
+    # Partial word match fallback
+    if team1_hits == 0 and team1.lower()[:4] in blob:
+        team1_hits = 0.5
+    if team2_hits == 0 and team2.lower()[:4] in blob:
+        team2_hits = 0.5
 
     score += team1_hits * 15.0
     score += team2_hits * 15.0
@@ -220,16 +325,16 @@ def score_game_candidate(m: Dict[str, Any], team1: str, team2: str) -> float:
     return score
 
 
+# ─────────────────────────────────────────
+# CORE ENDPOINTS
+# ─────────────────────────────────────────
+
 @app.get("/")
 def root():
     return {
         "message": "Polymarket GPT API is live",
         "status": "ok",
-        "apis": {
-            "gamma": GAMMA_BASE,
-            "clob": CLOB_BASE,
-            "data": DATA_BASE,
-        }
+        "apis": {"gamma": GAMMA_BASE, "clob": CLOB_BASE, "data": DATA_BASE}
     }
 
 
@@ -242,15 +347,13 @@ def health():
 def categories():
     return {
         "categories": ["all", "sports", "politics", "crypto", "news", "current-events"],
-        "sports": ["nba", "mls", "nfl", "mlb", "nhl", "soccer", "other"]
+        "sports": ["nba", "nfl", "mlb", "nhl", "mls", "soccer"]
     }
 
 
-# -------- Gamma discovery --------
-
 @app.get("/public-search")
 async def public_search(
-    q: str = Query(..., description="Search query"),
+    q: str = Query(...),
     limit_per_type: int = Query(default=25, ge=1, le=100),
     page: int = Query(default=1, ge=1),
     events_status: str = Query(default="active")
@@ -273,37 +376,39 @@ async def public_search(
 @app.get("/markets")
 async def markets(
     category: str = Query(default="all"),
+    sport: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100)
 ):
     raw = await fetch_json(
-        GAMMA_BASE,
-        "/markets",
+        GAMMA_BASE, "/markets",
         params={"limit": 200, "active": "true", "closed": "false"}
     )
-
     if not isinstance(raw, list):
-        raise HTTPException(status_code=502, detail="Unexpected response format from Gamma API")
+        raise HTTPException(status_code=502, detail="Unexpected response from Gamma API")
 
     items = raw
+
     if search:
         s = search.lower()
         items = [m for m in items if s in text_blob(m)]
 
-    if category.lower() == "sports":
-        terms = ["nba", "nfl", "mlb", "nhl", "mls", "soccer", "basketball", "football", "baseball", "hockey"]
-        items = [m for m in items if any(t in text_blob(m) for t in terms)]
-    elif category.lower() != "all":
+    if category.lower() == "sports" or sport:
+        sport_terms = ["nba", "nfl", "mlb", "nhl", "mls", "soccer",
+                       "basketball", "football", "baseball", "hockey"]
+        items = [m for m in items if any(t in text_blob(m) for t in sport_terms)]
+
+    if sport:
+        items = [m for m in items if matches_sport(m, sport)]
+
+    if category.lower() not in ("all", "sports"):
         items = [m for m in items if category.lower() in text_blob(m)]
 
-    items = sorted(
-        items,
-        key=lambda m: (liquidity_key(m), volume_key(m)),
-        reverse=True
-    )[:limit]
+    items = sorted(items, key=lambda m: (liquidity_key(m), volume_key(m)), reverse=True)[:limit]
 
     return {
         "category": category,
+        "sport": sport,
         "search": search,
         "limit": limit,
         "count": len(items),
@@ -314,20 +419,42 @@ async def markets(
 @app.get("/find-market")
 async def find_market(
     query: str = Query(...),
+    sport: Optional[str] = Query(default=None),
     limit: int = Query(default=10, ge=1, le=50)
 ):
-    search_res = await public_search(q=query, limit_per_type=limit, page=1, events_status="active")
-    markets = search_res.get("markets", [])
+    # Try multiple query variations to maximize hit rate
+    queries = [query]
+    if sport:
+        queries.append(f"{query} {sport}")
+
+    seen_ids = set()
+    all_markets = []
+
+    for q in queries:
+        try:
+            search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
+            for m in search_res.get("markets", []):
+                mid = m.get("id") or m.get("slug")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    all_markets.append(m)
+        except Exception:
+            continue
+
+    if sport:
+        all_markets = [m for m in all_markets if matches_sport(m, sport)]
+
     ranked = sorted(
-        markets,
+        all_markets,
         key=lambda m: extreme_price_penalty(m) + liquidity_key(m) / 100000.0 + volume_key(m) / 100000.0,
         reverse=True
-    )
-    ranked = [normalize_market(m) for m in ranked[:limit]]
+    )[:limit]
+
     return {
         "query": query,
+        "sport": sport,
         "count": len(ranked),
-        "markets": ranked
+        "markets": [normalize_market(m) for m in ranked]
     }
 
 
@@ -338,17 +465,31 @@ async def find_game(
     sport: str = Query(default="nba"),
     limit: int = Query(default=10, ge=1, le=30)
 ):
-    q = f"{team1} {team2} {sport}"
-    search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
+    queries = [
+        f"{team1} {team2}",
+        f"{team1} vs {team2}",
+        f"{team2} vs {team1}",
+        f"{team1} {sport}",
+        f"{team2} {sport}",
+        team1,
+        team2,
+    ]
 
-    raw_markets = search_res.get("markets", [])
-    ranked_pairs = []
+    seen_ids = set()
+    all_markets = []
 
-    for m in raw_markets:
-        score = score_game_candidate(m, team1, team2)
-        if score > 0:
-            ranked_pairs.append((score, m))
+    for q in queries:
+        try:
+            search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
+            for m in search_res.get("markets", []):
+                mid = m.get("id") or m.get("slug")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    all_markets.append(m)
+        except Exception:
+            continue
 
+    ranked_pairs = [(score_game_candidate(m, team1, team2), m) for m in all_markets]
     ranked_pairs.sort(key=lambda x: x[0], reverse=True)
 
     results = []
@@ -363,7 +504,7 @@ async def find_game(
         "team1": team1,
         "team2": team2,
         "sport": sport,
-        "queryUsed": q,
+        "queriesUsed": queries,
         "count": len(results),
         "markets": results
     }
@@ -381,17 +522,14 @@ async def market_details(
         raw = await fetch_json(GAMMA_BASE, f"/markets/{id}")
         return {"lookup": "id", "market": normalize_market(raw)}
 
-    raw = await fetch_json(
-        GAMMA_BASE,
-        "/markets",
-        params={"limit": 300, "active": "true", "closed": "false"}
-    )
+    raw = await fetch_json(GAMMA_BASE, "/markets",
+                           params={"limit": 300, "active": "true", "closed": "false"})
     if not isinstance(raw, list):
-        raise HTTPException(status_code=502, detail="Unexpected response format from Gamma API")
+        raise HTTPException(status_code=502, detail="Unexpected response from Gamma API")
 
     match = next((m for m in raw if str(m.get("slug", "")) == slug), None)
     if not match:
-        raise HTTPException(status_code=404, detail="Market not found for given slug")
+        raise HTTPException(status_code=404, detail="Market not found for slug")
 
     return {"lookup": "slug", "market": normalize_market(match)}
 
@@ -411,7 +549,7 @@ async def market_summary(
     elif team1 and team2:
         found = await find_game(team1=team1, team2=team2, sport=sport or "nba", limit=1)
         if found["count"] == 0:
-            raise HTTPException(status_code=404, detail="No likely game market found")
+            raise HTTPException(status_code=404, detail="No game market found")
         chosen_market = found["markets"][0]
     elif query:
         found = await find_market(query=query, limit=1)
@@ -419,7 +557,7 @@ async def market_summary(
             raise HTTPException(status_code=404, detail="No market found")
         chosen_market = found["markets"][0]
     else:
-        raise HTTPException(status_code=400, detail="Provide slug, query, or team1/team2")
+        raise HTTPException(status_code=400, detail="Provide slug, query, or team1+team2")
 
     token_ids = chosen_market.get("tokenIds") or []
     pricing = {}
@@ -438,11 +576,102 @@ async def market_summary(
     return {"market": chosen_market, "pricing": pricing}
 
 
-# -------- CLOB --------
+@app.get("/scan-market")
+async def scan_market(
+    slug: Optional[str] = Query(default=None),
+    id: Optional[str] = Query(default=None)
+):
+    if not slug and not id:
+        raise HTTPException(status_code=400, detail="Provide either slug or id")
+
+    details = await market_details(id=id, slug=slug)
+    chosen_market = details["market"]
+    token_ids = chosen_market.get("tokenIds") or []
+
+    all_pricing = []
+    outcomes = chosen_market.get("outcomes") or []
+
+    for i, token_id in enumerate(token_ids):
+        label = outcomes[i] if i < len(outcomes) else f"Token {i}"
+        try:
+            price = await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id})
+            midpoint = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
+            spread = await fetch_json(CLOB_BASE, "/spread", params={"token_id": token_id})
+            book = await fetch_json(CLOB_BASE, "/book", params={"token_id": token_id})
+            all_pricing.append({
+                "outcome": label,
+                "token_id": token_id,
+                "price": price,
+                "midpoint": midpoint,
+                "spread": spread,
+                "book_summary": {
+                    "best_bid": book.get("bids", [{}])[0] if book.get("bids") else None,
+                    "best_ask": book.get("asks", [{}])[0] if book.get("asks") else None,
+                    "bid_depth": len(book.get("bids", [])),
+                    "ask_depth": len(book.get("asks", [])),
+                }
+            })
+        except Exception as e:
+            all_pricing.append({"outcome": label, "token_id": token_id, "error": str(e)})
+
+    return {
+        "market": chosen_market,
+        "clob_pricing": all_pricing
+    }
+
+
+@app.get("/best-opportunities")
+async def best_opportunities(
+    category: str = Query(default="all"),
+    sport: Optional[str] = Query(default=None),
+    limit: int = Query(default=5, ge=1, le=20)
+):
+    data = await markets(category=category, sport=sport, search=None, limit=100)
+    items = data["markets"]
+
+    filtered = []
+    for m in items:
+        p = yes_price_from_market(m)
+        if p is not None and (p > 0.90 or p < 0.10):
+            continue
+        filtered.append(m)
+
+    ranked = sorted(filtered, key=lambda m: (liquidity_key(m), volume_key(m)), reverse=True)[:limit]
+
+    return {
+        "category": category,
+        "sport": sport,
+        "limit": limit,
+        "count": len(ranked),
+        "message": "Top active non-extreme markets ranked by liquidity and volume",
+        "opportunities": ranked
+    }
+
+
+# ─────────────────────────────────────────
+# CLOB ENDPOINTS
+# ─────────────────────────────────────────
 
 @app.get("/clob/price")
 async def clob_price(token_id: str = Query(...)):
     return await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id})
+
+
+@app.get("/clob/prices")
+async def clob_prices(token_ids: str = Query(..., description="Comma-separated token ids")):
+    ids = [t.strip() for t in token_ids.split(",") if t.strip()]
+    results = {}
+    for tid in ids:
+        try:
+            results[tid] = await fetch_json(CLOB_BASE, "/price", params={"token_id": tid})
+        except Exception as e:
+            results[tid] = {"error": str(e)}
+    return {"token_ids": ids, "prices": results}
+
+
+@app.get("/clob/book")
+async def clob_book(token_id: str = Query(...)):
+    return await fetch_json(CLOB_BASE, "/book", params={"token_id": token_id})
 
 
 @app.get("/clob/midpoint")
@@ -455,22 +684,14 @@ async def clob_spread(token_id: str = Query(...)):
     return await fetch_json(CLOB_BASE, "/spread", params={"token_id": token_id})
 
 
-@app.get("/clob/book")
-async def clob_book(token_id: str = Query(...)):
-    return await fetch_json(CLOB_BASE, "/book", params={"token_id": token_id})
-
-
 @app.get("/clob/history")
 async def clob_history(
     token_id: str = Query(...),
     interval: str = Query(default="1d"),
     fidelity: int = Query(default=60)
 ):
-    return await fetch_json(
-        CLOB_BASE,
-        "/prices-history",
-        params={"market": token_id, "interval": interval, "fidelity": fidelity}
-    )
+    return await fetch_json(CLOB_BASE, "/prices-history",
+                            params={"market": token_id, "interval": interval, "fidelity": fidelity})
 
 
 @app.get("/price-check")
@@ -481,7 +702,9 @@ async def price_check(token_id: str = Query(...)):
     return {"token_id": token_id, "price": price, "midpoint": midpoint, "spread": spread}
 
 
-# -------- Data API --------
+# ─────────────────────────────────────────
+# DATA API ENDPOINTS
+# ─────────────────────────────────────────
 
 @app.get("/data/open-interest")
 async def data_open_interest(market: Optional[str] = Query(default=None)):
@@ -515,37 +738,8 @@ async def data_trades(
 
 
 @app.get("/data/live-volume")
-async def data_live_volume():
-    return await fetch_json(DATA_BASE, "/live-volume")
-
-
-# -------- Scanner --------
-
-@app.get("/best-opportunities")
-async def best_opportunities(
-    category: str = Query(default="all"),
-    limit: int = Query(default=5, ge=1, le=20)
-):
-    data = await markets(category=category, search=None, limit=100)
-    items = data["markets"]
-
-    filtered = []
-    for m in items:
-        p = yes_price_from_market(m)
-        if p is not None and (p > 0.90 or p < 0.10):
-            continue
-        filtered.append(m)
-
-    ranked = sorted(
-        filtered,
-        key=lambda m: (liquidity_key(m), volume_key(m)),
-        reverse=True
-    )[:limit]
-
-    return {
-        "category": category,
-        "limit": limit,
-        "count": len(ranked),
-        "message": "Top active non-extreme markets ranked by liquidity and volume for GPT-side analysis",
-        "opportunities": ranked
-    }
+async def data_live_volume(event: Optional[str] = Query(default=None)):
+    params = {}
+    if event:
+        params["event"] = event
+    return await fetch_json(DATA_BASE, "/live-volume", params=params)
