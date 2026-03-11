@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, Any, List, Dict
+from datetime import datetime, timezone
 import httpx
 import json
 
@@ -19,8 +20,8 @@ app.add_middleware(
 )
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-CLOB_BASE = "https://clob.polymarket.com"
-DATA_BASE = "https://data-api.polymarket.com"
+CLOB_BASE  = "https://clob.polymarket.com"
+DATA_BASE  = "https://data-api.polymarket.com"
 
 
 # ─────────────────────────────────────────
@@ -77,6 +78,32 @@ def extract_token_ids(m: Dict[str, Any]) -> List[str]:
     return result
 
 
+def is_recent_market(m: Dict[str, Any]) -> bool:
+    """Return False if the market end date is in the past."""
+    end_date = m.get("endDate") or m.get("endDateIso")
+    if not end_date:
+        return True
+    try:
+        if isinstance(end_date, str):
+            end_date = end_date.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(end_date)
+            return dt > datetime.now(timezone.utc)
+    except Exception:
+        return True
+    return True
+
+
+def is_tradeable(m: Dict[str, Any]) -> bool:
+    """Return True only if market is active, not closed, and not expired."""
+    if m.get("closed"):
+        return False
+    if not m.get("active"):
+        return False
+    if not is_recent_market(m):
+        return False
+    return True
+
+
 def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": m.get("id"),
@@ -94,7 +121,7 @@ def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
         "outcomePrices": parse_possible_json(m.get("outcomePrices")),
         "tokenIds": extract_token_ids(m),
         "rawConditionId": m.get("conditionId"),
-        # Extra useful fields from nested event markets
+        # Live pricing fields
         "sportsMarketType": m.get("sportsMarketType"),
         "bestBid": m.get("bestBid"),
         "bestAsk": m.get("bestAsk"),
@@ -108,33 +135,34 @@ def extract_markets_from_search(search_res: Dict[str, Any]) -> List[Dict[str, An
     """
     Polymarket public-search returns { events: [...], markets: [...] }.
     Game/sports markets live INSIDE events[N].markets[], not at the top level.
-    This function flattens both sources and deduplicates by id.
+    Flattens both, deduplicates by id, and filters out closed/expired markets.
     """
     seen_ids: set = set()
     found: List[Dict[str, Any]] = []
 
-    # Top-level markets (non-event markets, e.g. politics/crypto)
+    # Top-level markets (non-event markets e.g. politics/crypto)
     for m in search_res.get("markets", []):
+        if not is_tradeable(m):
+            continue
         mid = str(m.get("id") or m.get("slug") or "")
         if mid and mid not in seen_ids:
             seen_ids.add(mid)
             found.append(m)
 
-    # Markets nested inside events — this is where ALL sports game markets live
+    # Markets nested inside events — ALL sports game markets live here
     for event in search_res.get("events", []):
-        # Inherit event-level metadata that child markets lack
         event_category = event.get("category", "")
-        event_title = event.get("title", "")
+        event_title    = event.get("title", "")
         for m in event.get("markets", []):
+            if not is_tradeable(m):
+                continue
             mid = str(m.get("id") or m.get("slug") or "")
             if mid and mid not in seen_ids:
                 seen_ids.add(mid)
-                # Enrich market with event context
                 if not m.get("category"):
                     m["category"] = event_category
                 if not m.get("eventTitle"):
                     m["eventTitle"] = event_title
-                # Inherit liquidity/volume from event if market lacks them
                 if not m.get("liquidity") and not m.get("liquidityNum"):
                     m["liquidity"] = event.get("liquidity")
                 if not m.get("volume") and not m.get("volumeNum"):
@@ -177,7 +205,6 @@ def volume_key(m: Dict[str, Any]) -> float:
 
 
 def yes_price_from_market(m: Dict[str, Any]) -> Optional[float]:
-    # Prefer live bestAsk/lastTradePrice over outcomePrices
     for key in ("lastTradePrice", "bestAsk"):
         try:
             v = m.get(key)
@@ -207,108 +234,124 @@ def extreme_price_penalty(m: Dict[str, Any]) -> float:
 
 TEAM_ALIASES: Dict[str, List[str]] = {
     # NBA
-    "lakers": ["lakers", "los angeles lakers", "la lakers"],
-    "timberwolves": ["timberwolves", "wolves", "minnesota timberwolves", "min"],
-    "celtics": ["celtics", "boston celtics"],
-    "knicks": ["knicks", "new york knicks"],
-    "warriors": ["warriors", "golden state warriors"],
-    "nuggets": ["nuggets", "denver nuggets"],
-    "thunder": ["thunder", "oklahoma city thunder", "okc thunder"],
-    "mavericks": ["mavericks", "dallas mavericks", "mavs"],
-    "bucks": ["bucks", "milwaukee bucks"],
-    "heat": ["heat", "miami heat"],
-    "sixers": ["76ers", "sixers", "philadelphia 76ers"],
-    "spurs": ["spurs", "san antonio spurs"],
-    "clippers": ["clippers", "la clippers", "los angeles clippers"],
-    "suns": ["suns", "phoenix suns"],
-    "bulls": ["bulls", "chicago bulls"],
-    "pistons": ["pistons", "detroit pistons"],
-    "grizzlies": ["grizzlies", "memphis grizzlies"],
-    "pelicans": ["pelicans", "new orleans pelicans"],
-    "pacers": ["pacers", "indiana pacers"],
-    "hawks": ["hawks", "atlanta hawks"],
-    "nets": ["nets", "brooklyn nets"],
-    "raptors": ["raptors", "toronto raptors"],
-    "magic": ["magic", "orlando magic"],
-    "cavaliers": ["cavaliers", "cavs", "cleveland cavaliers"],
-    "wizards": ["wizards", "washington wizards"],
-    "kings": ["kings", "sacramento kings"],
-    "jazz": ["jazz", "utah jazz"],
-    "rockets": ["rockets", "houston rockets"],
+    "lakers":        ["lakers", "los angeles lakers", "la lakers"],
+    "timberwolves":  ["timberwolves", "wolves", "minnesota timberwolves", "min"],
+    "celtics":       ["celtics", "boston celtics"],
+    "knicks":        ["knicks", "new york knicks"],
+    "warriors":      ["warriors", "golden state warriors"],
+    "nuggets":       ["nuggets", "denver nuggets"],
+    "thunder":       ["thunder", "oklahoma city thunder", "okc thunder"],
+    "mavericks":     ["mavericks", "dallas mavericks", "mavs"],
+    "bucks":         ["bucks", "milwaukee bucks"],
+    "heat":          ["heat", "miami heat"],
+    "sixers":        ["76ers", "sixers", "philadelphia 76ers"],
+    "spurs":         ["spurs", "san antonio spurs"],
+    "clippers":      ["clippers", "la clippers", "los angeles clippers"],
+    "suns":          ["suns", "phoenix suns"],
+    "bulls":         ["bulls", "chicago bulls"],
+    "pistons":       ["pistons", "detroit pistons"],
+    "grizzlies":     ["grizzlies", "memphis grizzlies"],
+    "pelicans":      ["pelicans", "new orleans pelicans"],
+    "pacers":        ["pacers", "indiana pacers"],
+    "hawks":         ["hawks", "atlanta hawks"],
+    "nets":          ["nets", "brooklyn nets"],
+    "raptors":       ["raptors", "toronto raptors"],
+    "magic":         ["magic", "orlando magic"],
+    "cavaliers":     ["cavaliers", "cavs", "cleveland cavaliers"],
+    "wizards":       ["wizards", "washington wizards"],
+    "kings":         ["kings", "sacramento kings"],
+    "jazz":          ["jazz", "utah jazz"],
+    "rockets":       ["rockets", "houston rockets"],
     "trail blazers": ["trail blazers", "blazers", "portland trail blazers"],
-    "hornets": ["hornets", "charlotte hornets"],
+    "hornets":       ["hornets", "charlotte hornets"],
     # NFL
-    "chiefs": ["chiefs", "kansas city chiefs"],
-    "eagles": ["eagles", "philadelphia eagles"],
-    "patriots": ["patriots", "new england patriots"],
-    "cowboys": ["cowboys", "dallas cowboys"],
-    "49ers": ["49ers", "san francisco 49ers", "niners"],
-    "ravens": ["ravens", "baltimore ravens"],
-    "bills": ["bills", "buffalo bills"],
-    "bengals": ["bengals", "cincinnati bengals"],
-    "steelers": ["steelers", "pittsburgh steelers"],
-    "packers": ["packers", "green bay packers"],
-    "bears": ["bears", "chicago bears"],
-    "giants": ["giants", "new york giants"],
-    "jets": ["jets", "new york jets"],
-    "dolphins": ["dolphins", "miami dolphins"],
-    "broncos": ["broncos", "denver broncos"],
-    "raiders": ["raiders", "las vegas raiders"],
-    "chargers": ["chargers", "los angeles chargers"],
-    "seahawks": ["seahawks", "seattle seahawks"],
-    "rams": ["rams", "los angeles rams"],
-    "cardinals": ["cardinals", "arizona cardinals"],
-    "saints": ["saints", "new orleans saints"],
-    "buccaneers": ["buccaneers", "bucs", "tampa bay buccaneers"],
-    "falcons": ["falcons", "atlanta falcons"],
-    "panthers": ["panthers", "carolina panthers"],
-    "vikings": ["vikings", "minnesota vikings"],
-    "lions": ["lions", "detroit lions"],
-    "colts": ["colts", "indianapolis colts"],
-    "jaguars": ["jaguars", "jacksonville jaguars"],
-    "titans": ["titans", "tennessee titans"],
-    "texans": ["texans", "houston texans"],
-    "browns": ["browns", "cleveland browns"],
+    "chiefs":        ["chiefs", "kansas city chiefs"],
+    "eagles":        ["eagles", "philadelphia eagles"],
+    "patriots":      ["patriots", "new england patriots"],
+    "cowboys":       ["cowboys", "dallas cowboys"],
+    "49ers":         ["49ers", "san francisco 49ers", "niners"],
+    "ravens":        ["ravens", "baltimore ravens"],
+    "bills":         ["bills", "buffalo bills"],
+    "bengals":       ["bengals", "cincinnati bengals"],
+    "steelers":      ["steelers", "pittsburgh steelers"],
+    "packers":       ["packers", "green bay packers"],
+    "bears":         ["bears", "chicago bears"],
+    "giants":        ["giants", "new york giants"],
+    "jets":          ["jets", "new york jets"],
+    "dolphins":      ["dolphins", "miami dolphins"],
+    "broncos":       ["broncos", "denver broncos"],
+    "raiders":       ["raiders", "las vegas raiders"],
+    "chargers":      ["chargers", "los angeles chargers"],
+    "seahawks":      ["seahawks", "seattle seahawks"],
+    "rams":          ["rams", "los angeles rams"],
+    "cardinals":     ["cardinals", "arizona cardinals"],
+    "saints":        ["saints", "new orleans saints"],
+    "buccaneers":    ["buccaneers", "bucs", "tampa bay buccaneers"],
+    "falcons":       ["falcons", "atlanta falcons"],
+    "panthers":      ["panthers", "carolina panthers"],
+    "vikings":       ["vikings", "minnesota vikings"],
+    "lions":         ["lions", "detroit lions"],
+    "colts":         ["colts", "indianapolis colts"],
+    "jaguars":       ["jaguars", "jacksonville jaguars"],
+    "titans":        ["titans", "tennessee titans"],
+    "texans":        ["texans", "houston texans"],
+    "browns":        ["browns", "cleveland browns"],
     # MLB
-    "yankees": ["yankees", "new york yankees"],
-    "dodgers": ["dodgers", "los angeles dodgers"],
-    "red sox": ["red sox", "boston red sox"],
-    "cubs": ["cubs", "chicago cubs"],
-    "mets": ["mets", "new york mets"],
-    "braves": ["braves", "atlanta braves"],
-    "astros": ["astros", "houston astros"],
-    "giants sf": ["giants", "san francisco giants"],
-    "padres": ["padres", "san diego padres"],
-    "phillies": ["phillies", "philadelphia phillies"],
+    "yankees":       ["yankees", "new york yankees"],
+    "dodgers":       ["dodgers", "los angeles dodgers"],
+    "red sox":       ["red sox", "boston red sox"],
+    "cubs":          ["cubs", "chicago cubs"],
+    "mets":          ["mets", "new york mets"],
+    "braves":        ["braves", "atlanta braves"],
+    "astros":        ["astros", "houston astros"],
+    "giants sf":     ["giants", "san francisco giants"],
+    "padres":        ["padres", "san diego padres"],
+    "phillies":      ["phillies", "philadelphia phillies"],
     # NHL
-    "rangers": ["rangers", "new york rangers"],
-    "bruins": ["bruins", "boston bruins"],
-    "maple leafs": ["maple leafs", "toronto maple leafs", "leafs"],
-    "blackhawks": ["blackhawks", "chicago blackhawks"],
-    "penguins": ["penguins", "pittsburgh penguins"],
-    "capitals": ["capitals", "washington capitals", "caps"],
-    "lightning": ["lightning", "tampa bay lightning"],
-    "avalanche": ["avalanche", "colorado avalanche", "avs"],
+    "rangers":        ["rangers", "new york rangers"],
+    "bruins":         ["bruins", "boston bruins"],
+    "maple leafs":    ["maple leafs", "toronto maple leafs", "leafs"],
+    "blackhawks":     ["blackhawks", "chicago blackhawks"],
+    "penguins":       ["penguins", "pittsburgh penguins"],
+    "capitals":       ["capitals", "washington capitals", "caps"],
+    "lightning":      ["lightning", "tampa bay lightning"],
+    "avalanche":      ["avalanche", "colorado avalanche", "avs"],
     "golden knights": ["golden knights", "vegas golden knights"],
-    "oilers": ["oilers", "edmonton oilers"],
-    "flames": ["flames", "calgary flames"],
-    "canucks": ["canucks", "vancouver canucks"],
+    "oilers":         ["oilers", "edmonton oilers"],
+    "flames":         ["flames", "calgary flames"],
+    "canucks":        ["canucks", "vancouver canucks"],
+    "hurricanes":     ["hurricanes", "carolina hurricanes", "canes"],
+    "islanders":      ["islanders", "new york islanders"],
+    "blues":          ["blues", "st. louis blues"],
+    "predators":      ["predators", "nashville predators", "preds"],
+    "winnipeg jets":  ["jets", "winnipeg jets"],
+    "wild":           ["wild", "minnesota wild"],
+    "red wings":      ["red wings", "detroit red wings"],
+    "sabres":         ["sabres", "buffalo sabres"],
+    "senators":       ["senators", "ottawa senators"],
+    "canadiens":      ["canadiens", "montreal canadiens", "habs"],
+    "sharks":         ["sharks", "san jose sharks"],
+    "ducks":          ["ducks", "anaheim ducks"],
+    "kings nhl":      ["kings", "los angeles kings"],
+    "panthers nhl":   ["panthers", "florida panthers"],
+    "kraken":         ["kraken", "seattle kraken"],
+    "blue jackets":   ["blue jackets", "columbus blue jackets"],
     # Soccer
-    "manchester city": ["manchester city", "man city"],
-    "arsenal": ["arsenal"],
-    "liverpool": ["liverpool"],
-    "chelsea": ["chelsea"],
-    "real madrid": ["real madrid"],
-    "barcelona": ["barcelona", "barca"],
+    "manchester city":   ["manchester city", "man city"],
+    "arsenal":           ["arsenal"],
+    "liverpool":         ["liverpool"],
+    "chelsea":           ["chelsea"],
+    "real madrid":       ["real madrid"],
+    "barcelona":         ["barcelona", "barca"],
     "manchester united": ["manchester united", "man united", "man utd"],
-    "tottenham": ["tottenham", "spurs", "tottenham hotspur"],
-    "bayern munich": ["bayern munich", "bayern"],
-    "psg": ["psg", "paris saint-germain", "paris saint germain"],
-    "juventus": ["juventus", "juve"],
-    "inter milan": ["inter milan", "inter"],
-    "ac milan": ["ac milan", "milan"],
-    "atletico madrid": ["atletico madrid", "atletico"],
-    "dortmund": ["dortmund", "borussia dortmund", "bvb"],
+    "tottenham":         ["tottenham", "spurs", "tottenham hotspur"],
+    "bayern munich":     ["bayern munich", "bayern"],
+    "psg":               ["psg", "paris saint-germain", "paris saint germain"],
+    "juventus":          ["juventus", "juve"],
+    "inter milan":       ["inter milan", "inter"],
+    "ac milan":          ["ac milan", "milan"],
+    "atletico madrid":   ["atletico madrid", "atletico"],
+    "dortmund":          ["dortmund", "borussia dortmund", "bvb"],
 }
 
 FUTURES_TERMS = [
@@ -326,15 +369,14 @@ GAME_TERMS = [
 ]
 
 SPORT_TERMS = {
-    "nba": ["nba", "basketball"],
-    "nfl": ["nfl", "football"],
-    "mlb": ["mlb", "baseball"],
-    "nhl": ["nhl", "hockey"],
-    "mls": ["mls", "soccer", "football"],
+    "nba":    ["nba", "basketball"],
+    "nfl":    ["nfl", "football"],
+    "mlb":    ["mlb", "baseball"],
+    "nhl":    ["nhl", "hockey"],
+    "mls":    ["mls", "soccer"],
     "soccer": ["soccer", "football", "epl", "champions league", "la liga", "serie a", "bundesliga"],
 }
 
-# sportsMarketType values that are the main moneyline/winner market
 MONEYLINE_TYPES = {"moneyline", "winner", "match_winner", None}
 
 
@@ -354,10 +396,8 @@ def is_game_market(m: Dict[str, Any]) -> bool:
 
 
 def is_moneyline_market(m: Dict[str, Any]) -> bool:
-    """Prefer the main moneyline/winner market over spreads/totals."""
     smt = m.get("sportsMarketType")
     if smt is None:
-        # Fall back to question heuristic
         q = (m.get("question") or "").lower()
         return "moneyline" in q or ("vs" in q and "spread" not in q and "o/u" not in q and "total" not in q)
     return smt in MONEYLINE_TYPES
@@ -372,13 +412,12 @@ def matches_sport(m: Dict[str, Any], sport: Optional[str]) -> bool:
 
 
 def score_game_candidate(m: Dict[str, Any], team1: str, team2: str) -> float:
-    blob = text_blob(m)
+    blob  = text_blob(m)
     score = 0.0
 
     team1_hits = sum(1 for t in aliases_for_team(team1) if t in blob)
     team2_hits = sum(1 for t in aliases_for_team(team2) if t in blob)
 
-    # Partial word match fallback
     if team1_hits == 0 and team1.lower()[:4] in blob:
         team1_hits = 0.5
     if team2_hits == 0 and team2.lower()[:4] in blob:
@@ -393,7 +432,6 @@ def score_game_candidate(m: Dict[str, Any], team1: str, team2: str) -> float:
     if is_game_market(m):
         score += 20.0
 
-    # Boost moneyline markets so they rank above spreads/totals
     if is_moneyline_market(m):
         score += 25.0
 
@@ -469,7 +507,7 @@ async def markets(
     if not isinstance(raw, list):
         raise HTTPException(status_code=502, detail="Unexpected response from Gamma API")
 
-    items = raw
+    items = [m for m in raw if is_tradeable(m)]
 
     if search:
         s = search.lower()
@@ -514,7 +552,6 @@ async def find_market(
     for q in queries:
         try:
             search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
-            # ✅ FIX: unwrap both top-level markets AND nested event markets
             for m in extract_markets_from_search(search_res):
                 mid = str(m.get("id") or m.get("slug") or "")
                 if mid and mid not in seen_ids:
@@ -547,7 +584,6 @@ async def find_game(
     sport: str = Query(default="nba"),
     limit: int = Query(default=10, ge=1, le=30)
 ):
-    # Build short team name variants for better search hit rate
     def short_name(team: str) -> str:
         parts = team.strip().split()
         return parts[-1] if len(parts) > 1 else team
@@ -566,7 +602,7 @@ async def find_game(
         t1_short,
         t2_short,
     ]
-    # Deduplicate queries
+
     seen_q: set = set()
     queries = [q for q in queries if not (q in seen_q or seen_q.add(q))]
 
@@ -576,7 +612,6 @@ async def find_game(
     for q in queries:
         try:
             search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
-            # ✅ FIX: unwrap both top-level markets AND nested event markets
             for m in extract_markets_from_search(search_res):
                 mid = str(m.get("id") or m.get("slug") or "")
                 if mid and mid not in seen_ids:
@@ -591,10 +626,10 @@ async def find_game(
     results = []
     for score, market in ranked_pairs[:limit]:
         nm = normalize_market(market)
-        nm["matchScore"] = round(score, 2)
-        nm["isProbableGameMarket"] = is_game_market(market)
+        nm["matchScore"]              = round(score, 2)
+        nm["isProbableGameMarket"]    = is_game_market(market)
         nm["isProbableFuturesMarket"] = is_futures_market(market)
-        nm["isProbableMoneyline"] = is_moneyline_market(market)
+        nm["isProbableMoneyline"]     = is_moneyline_market(market)
         results.append(nm)
 
     return {
@@ -619,14 +654,15 @@ async def market_details(
         raw = await fetch_json(GAMMA_BASE, f"/markets/{id}")
         return {"lookup": "id", "market": normalize_market(raw)}
 
-    # Slug lookup: try direct endpoint first, fall back to list scan
+    # Try slug param directly first
     try:
-        raw = await fetch_json(GAMMA_BASE, f"/markets", params={"slug": slug})
+        raw = await fetch_json(GAMMA_BASE, "/markets", params={"slug": slug})
         if isinstance(raw, list) and raw:
             return {"lookup": "slug", "market": normalize_market(raw[0])}
     except Exception:
         pass
 
+    # Fall back to list scan
     raw = await fetch_json(GAMMA_BASE, "/markets",
                            params={"limit": 300, "active": "true", "closed": "false"})
     if not isinstance(raw, list):
@@ -655,7 +691,6 @@ async def market_summary(
         found = await find_game(team1=team1, team2=team2, sport=sport or "nba", limit=5)
         if found["count"] == 0:
             raise HTTPException(status_code=404, detail="No game market found")
-        # Pick the best moneyline market if available, otherwise top result
         moneyline = next((m for m in found["markets"] if m.get("isProbableMoneyline")), None)
         chosen_market = moneyline or found["markets"][0]
     elif query:
@@ -673,9 +708,9 @@ async def market_summary(
         first_token = token_ids[0]
         try:
             pricing = {
-                "price": await fetch_json(CLOB_BASE, "/price", params={"token_id": first_token}),
+                "price":    await fetch_json(CLOB_BASE, "/price",    params={"token_id": first_token}),
                 "midpoint": await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": first_token}),
-                "spread": await fetch_json(CLOB_BASE, "/spread", params={"token_id": first_token}),
+                "spread":   await fetch_json(CLOB_BASE, "/spread",   params={"token_id": first_token}),
             }
         except Exception as e:
             pricing = {"error": str(e)}
@@ -701,19 +736,19 @@ async def scan_market(
     for i, token_id in enumerate(token_ids):
         label = outcomes[i] if i < len(outcomes) else f"Token {i}"
         try:
-            price = await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id})
+            price    = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id})
             midpoint = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
-            spread = await fetch_json(CLOB_BASE, "/spread", params={"token_id": token_id})
-            book = await fetch_json(CLOB_BASE, "/book", params={"token_id": token_id})
+            spread   = await fetch_json(CLOB_BASE, "/spread",   params={"token_id": token_id})
+            book     = await fetch_json(CLOB_BASE, "/book",     params={"token_id": token_id})
             all_pricing.append({
-                "outcome": label,
+                "outcome":  label,
                 "token_id": token_id,
-                "price": price,
+                "price":    price,
                 "midpoint": midpoint,
-                "spread": spread,
+                "spread":   spread,
                 "book_summary": {
-                    "best_bid": book.get("bids", [{}])[0] if book.get("bids") else None,
-                    "best_ask": book.get("asks", [{}])[0] if book.get("asks") else None,
+                    "best_bid":  book.get("bids", [{}])[0] if book.get("bids") else None,
+                    "best_ask":  book.get("asks", [{}])[0] if book.get("asks") else None,
                     "bid_depth": len(book.get("bids", [])),
                     "ask_depth": len(book.get("asks", [])),
                 }
@@ -803,9 +838,9 @@ async def clob_history(
 
 @app.get("/price-check")
 async def price_check(token_id: str = Query(...)):
-    price = await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id})
+    price    = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id})
     midpoint = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
-    spread = await fetch_json(CLOB_BASE, "/spread", params={"token_id": token_id})
+    spread   = await fetch_json(CLOB_BASE, "/spread",   params={"token_id": token_id})
     return {"token_id": token_id, "price": price, "midpoint": midpoint, "spread": spread}
 
 
