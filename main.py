@@ -86,15 +86,62 @@ def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
         "endDate": m.get("endDate"),
         "active": m.get("active"),
         "closed": m.get("closed"),
-        "liquidity": m.get("liquidity"),
-        "volume": m.get("volume"),
+        "liquidity": m.get("liquidity") or m.get("liquidityNum") or m.get("liquidityClob"),
+        "volume": m.get("volume") or m.get("volumeNum"),
         "description": m.get("description"),
         "image": m.get("image"),
         "outcomes": parse_possible_json(m.get("outcomes")),
         "outcomePrices": parse_possible_json(m.get("outcomePrices")),
         "tokenIds": extract_token_ids(m),
         "rawConditionId": m.get("conditionId"),
+        # Extra useful fields from nested event markets
+        "sportsMarketType": m.get("sportsMarketType"),
+        "bestBid": m.get("bestBid"),
+        "bestAsk": m.get("bestAsk"),
+        "lastTradePrice": m.get("lastTradePrice"),
+        "spread": m.get("spread"),
+        "gameStartTime": m.get("gameStartTime"),
     }
+
+
+def extract_markets_from_search(search_res: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Polymarket public-search returns { events: [...], markets: [...] }.
+    Game/sports markets live INSIDE events[N].markets[], not at the top level.
+    This function flattens both sources and deduplicates by id.
+    """
+    seen_ids: set = set()
+    found: List[Dict[str, Any]] = []
+
+    # Top-level markets (non-event markets, e.g. politics/crypto)
+    for m in search_res.get("markets", []):
+        mid = str(m.get("id") or m.get("slug") or "")
+        if mid and mid not in seen_ids:
+            seen_ids.add(mid)
+            found.append(m)
+
+    # Markets nested inside events — this is where ALL sports game markets live
+    for event in search_res.get("events", []):
+        # Inherit event-level metadata that child markets lack
+        event_category = event.get("category", "")
+        event_title = event.get("title", "")
+        for m in event.get("markets", []):
+            mid = str(m.get("id") or m.get("slug") or "")
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                # Enrich market with event context
+                if not m.get("category"):
+                    m["category"] = event_category
+                if not m.get("eventTitle"):
+                    m["eventTitle"] = event_title
+                # Inherit liquidity/volume from event if market lacks them
+                if not m.get("liquidity") and not m.get("liquidityNum"):
+                    m["liquidity"] = event.get("liquidity")
+                if not m.get("volume") and not m.get("volumeNum"):
+                    m["volume"] = event.get("volume")
+                found.append(m)
+
+    return found
 
 
 def text_blob(m: Dict[str, Any]) -> str:
@@ -103,24 +150,41 @@ def text_blob(m: Dict[str, Any]) -> str:
         str(m.get("slug", "")),
         str(m.get("category", "")),
         str(m.get("description", "")),
+        str(m.get("eventTitle", "")),
     ]).lower()
 
 
 def liquidity_key(m: Dict[str, Any]) -> float:
-    try:
-        return float(m.get("liquidity") or 0)
-    except Exception:
-        return 0.0
+    for key in ("liquidity", "liquidityNum", "liquidityClob"):
+        try:
+            v = m.get(key)
+            if v is not None:
+                return float(v)
+        except Exception:
+            continue
+    return 0.0
 
 
 def volume_key(m: Dict[str, Any]) -> float:
-    try:
-        return float(m.get("volume") or 0)
-    except Exception:
-        return 0.0
+    for key in ("volume", "volumeNum", "volume24hr"):
+        try:
+            v = m.get(key)
+            if v is not None:
+                return float(v)
+        except Exception:
+            continue
+    return 0.0
 
 
 def yes_price_from_market(m: Dict[str, Any]) -> Optional[float]:
+    # Prefer live bestAsk/lastTradePrice over outcomePrices
+    for key in ("lastTradePrice", "bestAsk"):
+        try:
+            v = m.get(key)
+            if v is not None:
+                return float(v)
+        except Exception:
+            continue
     prices = parse_possible_json(m.get("outcomePrices"))
     if isinstance(prices, list) and prices:
         try:
@@ -144,7 +208,7 @@ def extreme_price_penalty(m: Dict[str, Any]) -> float:
 TEAM_ALIASES: Dict[str, List[str]] = {
     # NBA
     "lakers": ["lakers", "los angeles lakers", "la lakers"],
-    "timberwolves": ["timberwolves", "wolves", "minnesota timberwolves"],
+    "timberwolves": ["timberwolves", "wolves", "minnesota timberwolves", "min"],
     "celtics": ["celtics", "boston celtics"],
     "knicks": ["knicks", "new york knicks"],
     "warriors": ["warriors", "golden state warriors"],
@@ -257,7 +321,8 @@ FUTURES_TERMS = [
 
 GAME_TERMS = [
     "vs", "v.", "tonight", "today", "game", "match", "winner",
-    "moneyline", "spread", "over/under", "will win", "beat", "defeat"
+    "moneyline", "spread", "over/under", "will win", "beat", "defeat",
+    "1h", "2h", "first half", "second half", "total", "o/u"
 ]
 
 SPORT_TERMS = {
@@ -268,6 +333,9 @@ SPORT_TERMS = {
     "mls": ["mls", "soccer", "football"],
     "soccer": ["soccer", "football", "epl", "champions league", "la liga", "serie a", "bundesliga"],
 }
+
+# sportsMarketType values that are the main moneyline/winner market
+MONEYLINE_TYPES = {"moneyline", "winner", "match_winner", None}
 
 
 def aliases_for_team(name: str) -> List[str]:
@@ -283,6 +351,16 @@ def is_futures_market(m: Dict[str, Any]) -> bool:
 def is_game_market(m: Dict[str, Any]) -> bool:
     blob = text_blob(m)
     return any(term in blob for term in GAME_TERMS) and not is_futures_market(m)
+
+
+def is_moneyline_market(m: Dict[str, Any]) -> bool:
+    """Prefer the main moneyline/winner market over spreads/totals."""
+    smt = m.get("sportsMarketType")
+    if smt is None:
+        # Fall back to question heuristic
+        q = (m.get("question") or "").lower()
+        return "moneyline" in q or ("vs" in q and "spread" not in q and "o/u" not in q and "total" not in q)
+    return smt in MONEYLINE_TYPES
 
 
 def matches_sport(m: Dict[str, Any], sport: Optional[str]) -> bool:
@@ -314,6 +392,10 @@ def score_game_candidate(m: Dict[str, Any], team1: str, team2: str) -> float:
 
     if is_game_market(m):
         score += 20.0
+
+    # Boost moneyline markets so they rank above spreads/totals
+    if is_moneyline_market(m):
+        score += 25.0
 
     if is_futures_market(m):
         score -= 35.0
@@ -422,19 +504,19 @@ async def find_market(
     sport: Optional[str] = Query(default=None),
     limit: int = Query(default=10, ge=1, le=50)
 ):
-    # Try multiple query variations to maximize hit rate
     queries = [query]
     if sport:
         queries.append(f"{query} {sport}")
 
-    seen_ids = set()
-    all_markets = []
+    seen_ids: set = set()
+    all_markets: List[Dict[str, Any]] = []
 
     for q in queries:
         try:
             search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
-            for m in search_res.get("markets", []):
-                mid = m.get("id") or m.get("slug")
+            # ✅ FIX: unwrap both top-level markets AND nested event markets
+            for m in extract_markets_from_search(search_res):
+                mid = str(m.get("id") or m.get("slug") or "")
                 if mid and mid not in seen_ids:
                     seen_ids.add(mid)
                     all_markets.append(m)
@@ -465,24 +547,38 @@ async def find_game(
     sport: str = Query(default="nba"),
     limit: int = Query(default=10, ge=1, le=30)
 ):
+    # Build short team name variants for better search hit rate
+    def short_name(team: str) -> str:
+        parts = team.strip().split()
+        return parts[-1] if len(parts) > 1 else team
+
+    t1_short = short_name(team1)
+    t2_short = short_name(team2)
+
     queries = [
         f"{team1} {team2}",
         f"{team1} vs {team2}",
         f"{team2} vs {team1}",
+        f"{t1_short} {t2_short}",
+        f"{t1_short} vs {t2_short}",
         f"{team1} {sport}",
         f"{team2} {sport}",
-        team1,
-        team2,
+        t1_short,
+        t2_short,
     ]
+    # Deduplicate queries
+    seen_q: set = set()
+    queries = [q for q in queries if not (q in seen_q or seen_q.add(q))]
 
-    seen_ids = set()
-    all_markets = []
+    seen_ids: set = set()
+    all_markets: List[Dict[str, Any]] = []
 
     for q in queries:
         try:
             search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
-            for m in search_res.get("markets", []):
-                mid = m.get("id") or m.get("slug")
+            # ✅ FIX: unwrap both top-level markets AND nested event markets
+            for m in extract_markets_from_search(search_res):
+                mid = str(m.get("id") or m.get("slug") or "")
                 if mid and mid not in seen_ids:
                     seen_ids.add(mid)
                     all_markets.append(m)
@@ -498,6 +594,7 @@ async def find_game(
         nm["matchScore"] = round(score, 2)
         nm["isProbableGameMarket"] = is_game_market(market)
         nm["isProbableFuturesMarket"] = is_futures_market(market)
+        nm["isProbableMoneyline"] = is_moneyline_market(market)
         results.append(nm)
 
     return {
@@ -521,6 +618,14 @@ async def market_details(
     if id:
         raw = await fetch_json(GAMMA_BASE, f"/markets/{id}")
         return {"lookup": "id", "market": normalize_market(raw)}
+
+    # Slug lookup: try direct endpoint first, fall back to list scan
+    try:
+        raw = await fetch_json(GAMMA_BASE, f"/markets", params={"slug": slug})
+        if isinstance(raw, list) and raw:
+            return {"lookup": "slug", "market": normalize_market(raw[0])}
+    except Exception:
+        pass
 
     raw = await fetch_json(GAMMA_BASE, "/markets",
                            params={"limit": 300, "active": "true", "closed": "false"})
@@ -547,10 +652,12 @@ async def market_summary(
     if slug:
         chosen_market = (await market_details(slug=slug))["market"]
     elif team1 and team2:
-        found = await find_game(team1=team1, team2=team2, sport=sport or "nba", limit=1)
+        found = await find_game(team1=team1, team2=team2, sport=sport or "nba", limit=5)
         if found["count"] == 0:
             raise HTTPException(status_code=404, detail="No game market found")
-        chosen_market = found["markets"][0]
+        # Pick the best moneyline market if available, otherwise top result
+        moneyline = next((m for m in found["markets"] if m.get("isProbableMoneyline")), None)
+        chosen_market = moneyline or found["markets"][0]
     elif query:
         found = await find_market(query=query, limit=1)
         if found["count"] == 0:
