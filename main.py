@@ -7,7 +7,7 @@ import json
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.0.0",
+    version="5.1.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, and Data APIs"
 )
 
@@ -23,7 +23,26 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE  = "https://clob.polymarket.com"
 DATA_BASE  = "https://data-api.polymarket.com"
 
-# Sports market types that are game markets (not futures)
+# Confirmed Polymarket slug prefixes by sport
+# These are derived from real Polymarket URLs and are the most reliable search terms
+SLUG_PREFIXES: Dict[str, List[str]] = {
+    "nba":    ["nba-"],
+    "nhl":    ["nhl-"],
+    "mlb":    ["mlb-"],
+    "nfl":    ["nfl-"],
+    "cbb":    ["cbb-"],
+    "mls":    ["mls-"],
+    "epl":    ["epl-"],
+    "ucl":    ["ucl-"],
+    "ufc":    ["ufc-"],
+    "soccer": ["epl-", "ucl-", "mls-", "liga-", "seri-", "bund-"],
+    "all":    ["nba-", "nhl-", "mlb-", "nfl-", "cbb-", "mls-", "epl-", "ucl-", "ufc-"],
+}
+
+# All slug prefixes to search when no sport filter is given
+ALL_SPORT_PREFIXES = ["nba-", "nhl-", "mlb-", "nfl-", "cbb-", "mls-", "epl-", "ucl-", "ufc-"]
+
+# Sports market types that are game markets
 GAME_MARKET_TYPES = {
     "moneyline", "winner", "match_winner",
     "spreads", "first_half_spreads", "second_half_spreads",
@@ -31,7 +50,7 @@ GAME_MARKET_TYPES = {
     "player_props", "team_props"
 }
 
-# Sports market types that are futures (filter these out from game scans)
+# Sports market types that are futures
 FUTURES_MARKET_TYPES = {
     "outright_winner", "futures", "season_wins",
     "playoff_odds", "championship"
@@ -119,13 +138,12 @@ def is_tradeable(m: Dict[str, Any]) -> bool:
 
 
 def is_futures_market(m: Dict[str, Any]) -> bool:
-    """Detect futures/season markets using sportsMarketType first, then keyword fallback."""
+    """Detect futures markets using sportsMarketType first, then keyword fallback."""
     smt = m.get("sportsMarketType")
     if smt and smt in FUTURES_MARKET_TYPES:
         return True
     if smt and smt in GAME_MARKET_TYPES:
         return False
-    # Keyword fallback for markets without sportsMarketType
     blob = text_blob(m)
     futures_terms = [
         "finals", "championship", "champion", "stanley cup", "super bowl",
@@ -133,7 +151,8 @@ def is_futures_market(m: Dict[str, Any]) -> bool:
         "to win the 2026", "to win the nba finals", "season wins",
         "to win the", "most wins", "win the nba", "win the nfl",
         "win the mlb", "win the nhl", "reach the finals", "make the playoffs",
-        "to win the 2025", "ncaa tournament", "march madness champion"
+        "to win the 2025", "ncaa tournament", "march madness champion",
+        "to win the 2027",
     ]
     return any(term in blob for term in futures_terms)
 
@@ -166,6 +185,13 @@ def is_moneyline_market(m: Dict[str, Any]) -> bool:
         "1h" not in q and
         "2h" not in q
     )
+
+
+def has_sport_slug_prefix(m: Dict[str, Any], prefixes: List[str]) -> bool:
+    """Check if a market slug starts with any of the given sport prefixes."""
+    slug = (m.get("slug") or "").lower()
+    event_slug = (m.get("eventSlug") or "").lower()
+    return any(slug.startswith(p) or event_slug.startswith(p) for p in prefixes)
 
 
 def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -260,39 +286,44 @@ def extreme_price_penalty(m: Dict[str, Any]) -> float:
 def extract_markets_from_search(
     search_res: Dict[str, Any],
     game_markets_only: bool = False,
-    exclude_futures: bool = False
+    exclude_futures: bool = False,
+    slug_prefixes: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Polymarket public-search returns { events: [...], markets: [...] }.
-    Game/sports markets live INSIDE events[N].markets[].
-    Flattens both, deduplicates, filters closed/expired markets.
+    Flattens events and top-level markets from public-search response.
+    Filters closed/expired markets. Optionally filters by game type, futures, or slug prefix.
     """
     seen_ids: set = set()
     found: List[Dict[str, Any]] = []
 
-    # Top-level markets
-    for m in search_res.get("markets", []):
+    def should_include(m: Dict[str, Any]) -> bool:
         if not is_tradeable(m):
-            continue
+            return False
         if game_markets_only and not is_game_market(m):
-            continue
+            return False
         if exclude_futures and is_futures_market(m):
+            return False
+        if slug_prefixes and not has_sport_slug_prefix(m, slug_prefixes):
+            return False
+        return True
+
+    for m in search_res.get("markets", []):
+        if not should_include(m):
             continue
         mid = str(m.get("id") or m.get("slug") or "")
         if mid and mid not in seen_ids:
             seen_ids.add(mid)
             found.append(m)
 
-    # Markets nested inside events
     for event in search_res.get("events", []):
         event_category = event.get("category", "")
         event_title    = event.get("title", "")
+        event_slug     = event.get("slug", "")
         for m in event.get("markets", []):
-            if not is_tradeable(m):
-                continue
-            if game_markets_only and not is_game_market(m):
-                continue
-            if exclude_futures and is_futures_market(m):
+            # Inject event slug so has_sport_slug_prefix can check it
+            if not m.get("eventSlug"):
+                m["eventSlug"] = event_slug
+            if not should_include(m):
                 continue
             mid = str(m.get("id") or m.get("slug") or "")
             if mid and mid not in seen_ids:
@@ -432,16 +463,6 @@ TEAM_ALIASES: Dict[str, List[str]] = {
     "dortmund":          ["dortmund", "borussia dortmund", "bvb"],
 }
 
-SPORT_TERMS = {
-    "nba":    ["nba", "basketball"],
-    "nfl":    ["nfl", "football"],
-    "mlb":    ["mlb", "baseball"],
-    "nhl":    ["nhl", "hockey"],
-    "cbb":    ["cbb", "ncaab", "college basketball"],
-    "mls":    ["mls", "soccer"],
-    "soccer": ["soccer", "football", "epl", "champions league", "la liga", "serie a", "bundesliga"],
-}
-
 
 def aliases_for_team(name: str) -> List[str]:
     key = name.lower().strip()
@@ -451,9 +472,8 @@ def aliases_for_team(name: str) -> List[str]:
 def matches_sport(m: Dict[str, Any], sport: Optional[str]) -> bool:
     if not sport or sport.lower() == "all":
         return True
-    blob = text_blob(m)
-    terms = SPORT_TERMS.get(sport.lower(), [sport.lower()])
-    return any(t in blob for t in terms)
+    prefixes = SLUG_PREFIXES.get(sport.lower(), [sport.lower() + "-"])
+    return has_sport_slug_prefix(m, prefixes)
 
 
 def score_game_candidate(m: Dict[str, Any], team1: str, team2: str) -> float:
@@ -499,8 +519,9 @@ def root():
     return {
         "message": "Polymarket GPT API is live",
         "status": "ok",
-        "version": "5.0.0",
-        "apis": {"gamma": GAMMA_BASE, "clob": CLOB_BASE, "data": DATA_BASE}
+        "version": "5.1.0",
+        "apis": {"gamma": GAMMA_BASE, "clob": CLOB_BASE, "data": DATA_BASE},
+        "supported_sports": list(SLUG_PREFIXES.keys())
     }
 
 
@@ -513,7 +534,8 @@ def health():
 def categories():
     return {
         "categories": ["all", "sports", "politics", "crypto", "news", "current-events"],
-        "sports": ["nba", "nfl", "mlb", "nhl", "cbb", "mls", "soccer"]
+        "sports": list(SLUG_PREFIXES.keys()),
+        "slug_prefixes": SLUG_PREFIXES
     }
 
 
@@ -541,40 +563,35 @@ async def public_search(
 
 @app.get("/live-games")
 async def live_games(
-    sport: Optional[str] = Query(default=None, description="Filter by sport: nba, nhl, mlb, nfl, cbb, soccer. Leave empty for all sports."),
+    sport: Optional[str] = Query(default=None, description="Filter by sport: nba, nhl, mlb, nfl, cbb, mls, epl, ucl, ufc, soccer. Leave empty for all."),
     moneyline_only: bool = Query(default=False, description="Return only moneyline/winner markets"),
     limit: int = Query(default=50, ge=1, le=200)
 ):
     """
     Returns every active game market on Polymarket right now.
-    Searches by today's date — no need to know team names in advance.
-    Use this as the first call in any board scan instead of guessing the schedule.
+    Searches by confirmed slug prefixes (nba-, nhl-, cbb-, epl-, ucl-, mls-, ufc-, etc.)
+    No team names needed. Use this as the first call in any board scan.
     """
-    today = datetime.now(timezone.utc)
-    date_queries = [
-        today.strftime("%Y-%m-%d"),
-        today.strftime("%B %d").lstrip("0").replace(" 0", " "),  # e.g. "March 12"
-        today.strftime("%b %d").lstrip("0").replace(" 0", " "),  # e.g. "Mar 12"
-    ]
-
-    # Also search by sport if provided
-    sport_queries = []
-    if sport:
-        terms = SPORT_TERMS.get(sport.lower(), [sport.lower()])
-        sport_queries = terms[:2]  # limit to 2 sport terms
-
-    all_queries = date_queries + sport_queries
-    if not sport:
-        # Add generic sports queries to catch anything not date-tagged
-        all_queries += ["nba", "nhl", "cbb", "soccer", "mlb"]
+    # Determine which prefixes to search
+    if sport and sport.lower() != "all":
+        prefixes = SLUG_PREFIXES.get(sport.lower(), [sport.lower() + "-"])
+    else:
+        prefixes = ALL_SPORT_PREFIXES
 
     seen_ids: set = set()
     all_markets: List[Dict[str, Any]] = []
 
-    for q in all_queries:
+    for prefix in prefixes:
         try:
-            search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
-            for m in extract_markets_from_search(search_res, game_markets_only=True, exclude_futures=True):
+            search_res = await public_search(
+                q=prefix, limit_per_type=50, page=1, events_status="active"
+            )
+            for m in extract_markets_from_search(
+                search_res,
+                game_markets_only=True,
+                exclude_futures=True,
+                slug_prefixes=[prefix]
+            ):
                 mid = str(m.get("id") or m.get("slug") or "")
                 if mid and mid not in seen_ids:
                     seen_ids.add(mid)
@@ -582,20 +599,15 @@ async def live_games(
         except Exception:
             continue
 
-    # Filter by sport if provided
-    if sport:
-        all_markets = [m for m in all_markets if matches_sport(m, sport)]
-
-    # Filter to moneyline only if requested
     if moneyline_only:
         all_markets = [m for m in all_markets if is_moneyline_market(m)]
 
-    # Sort by liquidity descending
     all_markets.sort(key=liquidity_key, reverse=True)
 
     return {
-        "date": today.strftime("%Y-%m-%d"),
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "sport": sport or "all",
+        "prefixes_searched": prefixes,
         "moneyline_only": moneyline_only,
         "count": len(all_markets[:limit]),
         "markets": [normalize_market(m) for m in all_markets[:limit]]
@@ -623,9 +635,10 @@ async def markets(
         items = [m for m in items if s in text_blob(m)]
 
     if category.lower() == "sports" or sport:
-        sport_terms = ["nba", "nfl", "mlb", "nhl", "mls", "soccer",
-                       "basketball", "football", "baseball", "hockey", "cbb"]
-        items = [m for m in items if any(t in text_blob(m) for t in sport_terms)]
+        items = [m for m in items if any(
+            has_sport_slug_prefix(m, prefixes)
+            for prefixes in SLUG_PREFIXES.values()
+        )]
 
     if sport:
         items = [m for m in items if matches_sport(m, sport)]
@@ -653,7 +666,8 @@ async def find_market(
 ):
     queries = [query]
     if sport:
-        queries.append(f"{query} {sport}")
+        prefixes = SLUG_PREFIXES.get(sport.lower(), [sport.lower() + "-"])
+        queries += prefixes
 
     seen_ids: set = set()
     all_markets: List[Dict[str, Any]] = []
@@ -670,7 +684,8 @@ async def find_market(
             continue
 
     if sport:
-        all_markets = [m for m in all_markets if matches_sport(m, sport)]
+        prefixes = SLUG_PREFIXES.get(sport.lower(), [sport.lower() + "-"])
+        all_markets = [m for m in all_markets if has_sport_slug_prefix(m, prefixes)]
 
     ranked = sorted(
         all_markets,
@@ -700,7 +715,6 @@ async def find_game(
     t1_short = short_name(team1)
     t2_short = short_name(team2)
 
-    # Trimmed to most effective queries only for speed
     queries = [
         f"{t1_short} vs {t2_short}",
         f"{t2_short} vs {t1_short}",
@@ -978,7 +992,7 @@ async def clob_spread(token_id: str = Query(...)):
 @app.get("/clob/history")
 async def clob_history(
     token_id: str = Query(...),
-    interval: str = Query(default="6h", description="Time interval: 1m, 5m, 1h, 6h, 1d"),
+    interval: str = Query(default="6h", description="1m, 5m, 1h, 6h, 1d"),
     fidelity: int = Query(default=10, description="Number of data points")
 ):
     return await fetch_json(CLOB_BASE, "/prices-history",
