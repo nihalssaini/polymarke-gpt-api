@@ -7,7 +7,7 @@ import json
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="4.0.0",
+    version="5.0.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, and Data APIs"
 )
 
@@ -22,6 +22,20 @@ app.add_middleware(
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE  = "https://clob.polymarket.com"
 DATA_BASE  = "https://data-api.polymarket.com"
+
+# Sports market types that are game markets (not futures)
+GAME_MARKET_TYPES = {
+    "moneyline", "winner", "match_winner",
+    "spreads", "first_half_spreads", "second_half_spreads",
+    "totals", "first_half_totals", "second_half_totals",
+    "player_props", "team_props"
+}
+
+# Sports market types that are futures (filter these out from game scans)
+FUTURES_MARKET_TYPES = {
+    "outright_winner", "futures", "season_wins",
+    "playoff_odds", "championship"
+}
 
 
 # ─────────────────────────────────────────
@@ -104,6 +118,56 @@ def is_tradeable(m: Dict[str, Any]) -> bool:
     return True
 
 
+def is_futures_market(m: Dict[str, Any]) -> bool:
+    """Detect futures/season markets using sportsMarketType first, then keyword fallback."""
+    smt = m.get("sportsMarketType")
+    if smt and smt in FUTURES_MARKET_TYPES:
+        return True
+    if smt and smt in GAME_MARKET_TYPES:
+        return False
+    # Keyword fallback for markets without sportsMarketType
+    blob = text_blob(m)
+    futures_terms = [
+        "finals", "championship", "champion", "stanley cup", "super bowl",
+        "world series", "conference finals", "title", "mvp",
+        "to win the 2026", "to win the nba finals", "season wins",
+        "to win the", "most wins", "win the nba", "win the nfl",
+        "win the mlb", "win the nhl", "reach the finals", "make the playoffs",
+        "to win the 2025", "ncaa tournament", "march madness champion"
+    ]
+    return any(term in blob for term in futures_terms)
+
+
+def is_game_market(m: Dict[str, Any]) -> bool:
+    smt = m.get("sportsMarketType")
+    if smt and smt in GAME_MARKET_TYPES:
+        return True
+    if smt and smt in FUTURES_MARKET_TYPES:
+        return False
+    blob = text_blob(m)
+    game_terms = [
+        "vs", "v.", "tonight", "today", "game", "match", "winner",
+        "moneyline", "spread", "over/under", "will win", "beat", "defeat",
+        "1h", "2h", "first half", "second half", "total", "o/u"
+    ]
+    return any(term in blob for term in game_terms) and not is_futures_market(m)
+
+
+def is_moneyline_market(m: Dict[str, Any]) -> bool:
+    smt = m.get("sportsMarketType")
+    if smt:
+        return smt in {"moneyline", "winner", "match_winner"}
+    q = (m.get("question") or "").lower()
+    return "moneyline" in q or (
+        "vs" in q and
+        "spread" not in q and
+        "o/u" not in q and
+        "total" not in q and
+        "1h" not in q and
+        "2h" not in q
+    )
+
+
 def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": m.get("id"),
@@ -121,55 +185,16 @@ def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
         "outcomePrices": parse_possible_json(m.get("outcomePrices")),
         "tokenIds": extract_token_ids(m),
         "rawConditionId": m.get("conditionId"),
-        # Live pricing fields
         "sportsMarketType": m.get("sportsMarketType"),
         "bestBid": m.get("bestBid"),
         "bestAsk": m.get("bestAsk"),
         "lastTradePrice": m.get("lastTradePrice"),
         "spread": m.get("spread"),
         "gameStartTime": m.get("gameStartTime"),
+        "isGameMarket": is_game_market(m),
+        "isFuturesMarket": is_futures_market(m),
+        "isMoneyline": is_moneyline_market(m),
     }
-
-
-def extract_markets_from_search(search_res: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Polymarket public-search returns { events: [...], markets: [...] }.
-    Game/sports markets live INSIDE events[N].markets[], not at the top level.
-    Flattens both, deduplicates by id, and filters out closed/expired markets.
-    """
-    seen_ids: set = set()
-    found: List[Dict[str, Any]] = []
-
-    # Top-level markets (non-event markets e.g. politics/crypto)
-    for m in search_res.get("markets", []):
-        if not is_tradeable(m):
-            continue
-        mid = str(m.get("id") or m.get("slug") or "")
-        if mid and mid not in seen_ids:
-            seen_ids.add(mid)
-            found.append(m)
-
-    # Markets nested inside events — ALL sports game markets live here
-    for event in search_res.get("events", []):
-        event_category = event.get("category", "")
-        event_title    = event.get("title", "")
-        for m in event.get("markets", []):
-            if not is_tradeable(m):
-                continue
-            mid = str(m.get("id") or m.get("slug") or "")
-            if mid and mid not in seen_ids:
-                seen_ids.add(mid)
-                if not m.get("category"):
-                    m["category"] = event_category
-                if not m.get("eventTitle"):
-                    m["eventTitle"] = event_title
-                if not m.get("liquidity") and not m.get("liquidityNum"):
-                    m["liquidity"] = event.get("liquidity")
-                if not m.get("volume") and not m.get("volumeNum"):
-                    m["volume"] = event.get("volume")
-                found.append(m)
-
-    return found
 
 
 def text_blob(m: Dict[str, Any]) -> str:
@@ -230,6 +255,59 @@ def extreme_price_penalty(m: Dict[str, Any]) -> float:
     if p > 0.85 or p < 0.15:
         return -12.0
     return 0.0
+
+
+def extract_markets_from_search(
+    search_res: Dict[str, Any],
+    game_markets_only: bool = False,
+    exclude_futures: bool = False
+) -> List[Dict[str, Any]]:
+    """
+    Polymarket public-search returns { events: [...], markets: [...] }.
+    Game/sports markets live INSIDE events[N].markets[].
+    Flattens both, deduplicates, filters closed/expired markets.
+    """
+    seen_ids: set = set()
+    found: List[Dict[str, Any]] = []
+
+    # Top-level markets
+    for m in search_res.get("markets", []):
+        if not is_tradeable(m):
+            continue
+        if game_markets_only and not is_game_market(m):
+            continue
+        if exclude_futures and is_futures_market(m):
+            continue
+        mid = str(m.get("id") or m.get("slug") or "")
+        if mid and mid not in seen_ids:
+            seen_ids.add(mid)
+            found.append(m)
+
+    # Markets nested inside events
+    for event in search_res.get("events", []):
+        event_category = event.get("category", "")
+        event_title    = event.get("title", "")
+        for m in event.get("markets", []):
+            if not is_tradeable(m):
+                continue
+            if game_markets_only and not is_game_market(m):
+                continue
+            if exclude_futures and is_futures_market(m):
+                continue
+            mid = str(m.get("id") or m.get("slug") or "")
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                if not m.get("category"):
+                    m["category"] = event_category
+                if not m.get("eventTitle"):
+                    m["eventTitle"] = event_title
+                if not m.get("liquidity") and not m.get("liquidityNum"):
+                    m["liquidity"] = event.get("liquidity")
+                if not m.get("volume") and not m.get("volumeNum"):
+                    m["volume"] = event.get("volume")
+                found.append(m)
+
+    return found
 
 
 TEAM_ALIASES: Dict[str, List[str]] = {
@@ -354,53 +432,20 @@ TEAM_ALIASES: Dict[str, List[str]] = {
     "dortmund":          ["dortmund", "borussia dortmund", "bvb"],
 }
 
-FUTURES_TERMS = [
-    "finals", "championship", "champion", "stanley cup", "super bowl",
-    "world series", "conference finals", "title", "mvp", "to win the 2026",
-    "to win the nba finals", "season wins", "to win the", "most wins",
-    "win the nba", "win the nfl", "win the mlb", "win the nhl",
-    "reach the finals", "make the playoffs"
-]
-
-GAME_TERMS = [
-    "vs", "v.", "tonight", "today", "game", "match", "winner",
-    "moneyline", "spread", "over/under", "will win", "beat", "defeat",
-    "1h", "2h", "first half", "second half", "total", "o/u"
-]
-
 SPORT_TERMS = {
     "nba":    ["nba", "basketball"],
     "nfl":    ["nfl", "football"],
     "mlb":    ["mlb", "baseball"],
     "nhl":    ["nhl", "hockey"],
+    "cbb":    ["cbb", "ncaab", "college basketball"],
     "mls":    ["mls", "soccer"],
     "soccer": ["soccer", "football", "epl", "champions league", "la liga", "serie a", "bundesliga"],
 }
-
-MONEYLINE_TYPES = {"moneyline", "winner", "match_winner", None}
 
 
 def aliases_for_team(name: str) -> List[str]:
     key = name.lower().strip()
     return TEAM_ALIASES.get(key, [key])
-
-
-def is_futures_market(m: Dict[str, Any]) -> bool:
-    blob = text_blob(m)
-    return any(term in blob for term in FUTURES_TERMS)
-
-
-def is_game_market(m: Dict[str, Any]) -> bool:
-    blob = text_blob(m)
-    return any(term in blob for term in GAME_TERMS) and not is_futures_market(m)
-
-
-def is_moneyline_market(m: Dict[str, Any]) -> bool:
-    smt = m.get("sportsMarketType")
-    if smt is None:
-        q = (m.get("question") or "").lower()
-        return "moneyline" in q or ("vs" in q and "spread" not in q and "o/u" not in q and "total" not in q)
-    return smt in MONEYLINE_TYPES
 
 
 def matches_sport(m: Dict[str, Any], sport: Optional[str]) -> bool:
@@ -454,6 +499,7 @@ def root():
     return {
         "message": "Polymarket GPT API is live",
         "status": "ok",
+        "version": "5.0.0",
         "apis": {"gamma": GAMMA_BASE, "clob": CLOB_BASE, "data": DATA_BASE}
     }
 
@@ -467,7 +513,7 @@ def health():
 def categories():
     return {
         "categories": ["all", "sports", "politics", "crypto", "news", "current-events"],
-        "sports": ["nba", "nfl", "mlb", "nhl", "mls", "soccer"]
+        "sports": ["nba", "nfl", "mlb", "nhl", "cbb", "mls", "soccer"]
     }
 
 
@@ -493,6 +539,69 @@ async def public_search(
     )
 
 
+@app.get("/live-games")
+async def live_games(
+    sport: Optional[str] = Query(default=None, description="Filter by sport: nba, nhl, mlb, nfl, cbb, soccer. Leave empty for all sports."),
+    moneyline_only: bool = Query(default=False, description="Return only moneyline/winner markets"),
+    limit: int = Query(default=50, ge=1, le=200)
+):
+    """
+    Returns every active game market on Polymarket right now.
+    Searches by today's date — no need to know team names in advance.
+    Use this as the first call in any board scan instead of guessing the schedule.
+    """
+    today = datetime.now(timezone.utc)
+    date_queries = [
+        today.strftime("%Y-%m-%d"),
+        today.strftime("%B %d").lstrip("0").replace(" 0", " "),  # e.g. "March 12"
+        today.strftime("%b %d").lstrip("0").replace(" 0", " "),  # e.g. "Mar 12"
+    ]
+
+    # Also search by sport if provided
+    sport_queries = []
+    if sport:
+        terms = SPORT_TERMS.get(sport.lower(), [sport.lower()])
+        sport_queries = terms[:2]  # limit to 2 sport terms
+
+    all_queries = date_queries + sport_queries
+    if not sport:
+        # Add generic sports queries to catch anything not date-tagged
+        all_queries += ["nba", "nhl", "cbb", "soccer", "mlb"]
+
+    seen_ids: set = set()
+    all_markets: List[Dict[str, Any]] = []
+
+    for q in all_queries:
+        try:
+            search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
+            for m in extract_markets_from_search(search_res, game_markets_only=True, exclude_futures=True):
+                mid = str(m.get("id") or m.get("slug") or "")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    all_markets.append(m)
+        except Exception:
+            continue
+
+    # Filter by sport if provided
+    if sport:
+        all_markets = [m for m in all_markets if matches_sport(m, sport)]
+
+    # Filter to moneyline only if requested
+    if moneyline_only:
+        all_markets = [m for m in all_markets if is_moneyline_market(m)]
+
+    # Sort by liquidity descending
+    all_markets.sort(key=liquidity_key, reverse=True)
+
+    return {
+        "date": today.strftime("%Y-%m-%d"),
+        "sport": sport or "all",
+        "moneyline_only": moneyline_only,
+        "count": len(all_markets[:limit]),
+        "markets": [normalize_market(m) for m in all_markets[:limit]]
+    }
+
+
 @app.get("/markets")
 async def markets(
     category: str = Query(default="all"),
@@ -515,7 +624,7 @@ async def markets(
 
     if category.lower() == "sports" or sport:
         sport_terms = ["nba", "nfl", "mlb", "nhl", "mls", "soccer",
-                       "basketball", "football", "baseball", "hockey"]
+                       "basketball", "football", "baseball", "hockey", "cbb"]
         items = [m for m in items if any(t in text_blob(m) for t in sport_terms)]
 
     if sport:
@@ -591,14 +700,11 @@ async def find_game(
     t1_short = short_name(team1)
     t2_short = short_name(team2)
 
+    # Trimmed to most effective queries only for speed
     queries = [
-        f"{team1} {team2}",
-        f"{team1} vs {team2}",
-        f"{team2} vs {team1}",
-        f"{t1_short} {t2_short}",
         f"{t1_short} vs {t2_short}",
-        f"{team1} {sport}",
-        f"{team2} {sport}",
+        f"{t2_short} vs {t1_short}",
+        f"{t1_short} {t2_short}",
         t1_short,
         t2_short,
     ]
@@ -612,7 +718,7 @@ async def find_game(
     for q in queries:
         try:
             search_res = await public_search(q=q, limit_per_type=50, page=1, events_status="active")
-            for m in extract_markets_from_search(search_res):
+            for m in extract_markets_from_search(search_res, exclude_futures=True):
                 mid = str(m.get("id") or m.get("slug") or "")
                 if mid and mid not in seen_ids:
                     seen_ids.add(mid)
@@ -626,17 +732,13 @@ async def find_game(
     results = []
     for score, market in ranked_pairs[:limit]:
         nm = normalize_market(market)
-        nm["matchScore"]              = round(score, 2)
-        nm["isProbableGameMarket"]    = is_game_market(market)
-        nm["isProbableFuturesMarket"] = is_futures_market(market)
-        nm["isProbableMoneyline"]     = is_moneyline_market(market)
+        nm["matchScore"] = round(score, 2)
         results.append(nm)
 
     return {
         "team1": team1,
         "team2": team2,
         "sport": sport,
-        "queriesUsed": queries,
         "count": len(results),
         "markets": results
     }
@@ -648,14 +750,16 @@ async def find_slug(
     team2: str = Query(...),
     sport: str = Query(default="nba")
 ):
-    """Find the actual Polymarket slug for a game — use this before scanMarket."""
+    """Find the actual Polymarket slug for a game. Always call before scanMarket."""
     found = await find_game(team1=team1, team2=team2, sport=sport, limit=5)
+    moneyline_markets = [m for m in found["markets"] if m.get("isMoneyline")]
     slugs = [m["slug"] for m in found["markets"] if m.get("slug")]
     return {
         "team1": team1,
         "team2": team2,
         "sport": sport,
         "slugs": slugs,
+        "recommended_slug": moneyline_markets[0]["slug"] if moneyline_markets else (slugs[0] if slugs else None),
         "markets": found["markets"]
     }
 
@@ -672,7 +776,6 @@ async def market_details(
         raw = await fetch_json(GAMMA_BASE, f"/markets/{id}")
         return {"lookup": "id", "market": normalize_market(raw)}
 
-    # Try slug param directly first
     try:
         raw = await fetch_json(GAMMA_BASE, "/markets", params={"slug": slug})
         if isinstance(raw, list) and raw:
@@ -680,7 +783,6 @@ async def market_details(
     except Exception:
         pass
 
-    # Fall back to list scan
     raw = await fetch_json(GAMMA_BASE, "/markets",
                            params={"limit": 300, "active": "true", "closed": "false"})
     if not isinstance(raw, list):
@@ -709,7 +811,7 @@ async def market_summary(
         found = await find_game(team1=team1, team2=team2, sport=sport or "nba", limit=5)
         if found["count"] == 0:
             raise HTTPException(status_code=404, detail="No game market found")
-        moneyline = next((m for m in found["markets"] if m.get("isProbableMoneyline")), None)
+        moneyline = next((m for m in found["markets"] if m.get("isMoneyline")), None)
         chosen_market = moneyline or found["markets"][0]
     elif query:
         found = await find_market(query=query, limit=1)
@@ -748,34 +850,50 @@ async def scan_market(
     details = await market_details(id=id, slug=slug)
     chosen_market = details["market"]
     token_ids = chosen_market.get("tokenIds") or []
+    outcomes = chosen_market.get("outcomes") or []
 
     all_pricing = []
-    outcomes = chosen_market.get("outcomes") or []
 
     for i, token_id in enumerate(token_ids):
         label = outcomes[i] if i < len(outcomes) else f"Token {i}"
+        result: Dict[str, Any] = {"outcome": label, "token_id": token_id}
+        errors = []
+
         try:
-            price_buy  = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id, "side": "BUY"})
-            price_sell = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id, "side": "SELL"})
-            midpoint   = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
-            spread     = await fetch_json(CLOB_BASE, "/spread",   params={"token_id": token_id})
-            book       = await fetch_json(CLOB_BASE, "/book",     params={"token_id": token_id})
-            all_pricing.append({
-                "outcome":    label,
-                "token_id":   token_id,
-                "price_buy":  price_buy,
-                "price_sell": price_sell,
-                "midpoint":   midpoint,
-                "spread":     spread,
-                "book_summary": {
-                    "best_bid":  book.get("bids", [{}])[0] if book.get("bids") else None,
-                    "best_ask":  book.get("asks", [{}])[0] if book.get("asks") else None,
-                    "bid_depth": len(book.get("bids", [])),
-                    "ask_depth": len(book.get("asks", [])),
-                }
-            })
+            result["price_buy"] = await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id, "side": "BUY"})
         except Exception as e:
-            all_pricing.append({"outcome": label, "token_id": token_id, "error": str(e)})
+            errors.append(f"price_buy: {str(e)}")
+
+        try:
+            result["price_sell"] = await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id, "side": "SELL"})
+        except Exception as e:
+            errors.append(f"price_sell: {str(e)}")
+
+        try:
+            result["midpoint"] = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
+        except Exception as e:
+            errors.append(f"midpoint: {str(e)}")
+
+        try:
+            result["spread"] = await fetch_json(CLOB_BASE, "/spread", params={"token_id": token_id})
+        except Exception as e:
+            errors.append(f"spread: {str(e)}")
+
+        try:
+            book = await fetch_json(CLOB_BASE, "/book", params={"token_id": token_id})
+            result["book_summary"] = {
+                "best_bid":  book.get("bids", [{}])[0] if book.get("bids") else None,
+                "best_ask":  book.get("asks", [{}])[0] if book.get("asks") else None,
+                "bid_depth": len(book.get("bids", [])),
+                "ask_depth": len(book.get("asks", [])),
+            }
+        except Exception as e:
+            errors.append(f"book: {str(e)}")
+
+        if errors:
+            result["errors"] = errors
+
+        all_pricing.append(result)
 
     return {
         "market": chosen_market,
@@ -787,7 +905,9 @@ async def scan_market(
 async def best_opportunities(
     category: str = Query(default="all"),
     sport: Optional[str] = Query(default=None),
-    limit: int = Query(default=5, ge=1, le=20)
+    limit: int = Query(default=5, ge=1, le=20),
+    min_price: float = Query(default=0.10, ge=0.0, le=0.5),
+    max_price: float = Query(default=0.90, ge=0.5, le=1.0)
 ):
     data = await markets(category=category, sport=sport, search=None, limit=100)
     items = data["markets"]
@@ -795,7 +915,7 @@ async def best_opportunities(
     filtered = []
     for m in items:
         p = yes_price_from_market(m)
-        if p is not None and (p > 0.90 or p < 0.10):
+        if p is not None and (p > max_price or p < min_price):
             continue
         filtered.append(m)
 
@@ -805,8 +925,10 @@ async def best_opportunities(
         "category": category,
         "sport": sport,
         "limit": limit,
+        "min_price": min_price,
+        "max_price": max_price,
         "count": len(ranked),
-        "message": "Top active non-extreme markets ranked by liquidity and volume",
+        "message": "Top active markets ranked by liquidity and volume",
         "opportunities": ranked
     }
 
@@ -856,8 +978,8 @@ async def clob_spread(token_id: str = Query(...)):
 @app.get("/clob/history")
 async def clob_history(
     token_id: str = Query(...),
-    interval: str = Query(default="1d"),
-    fidelity: int = Query(default=60)
+    interval: str = Query(default="6h", description="Time interval: 1m, 5m, 1h, 6h, 1d"),
+    fidelity: int = Query(default=10, description="Number of data points")
 ):
     return await fetch_json(CLOB_BASE, "/prices-history",
                             params={"market": token_id, "interval": interval, "fidelity": fidelity})
