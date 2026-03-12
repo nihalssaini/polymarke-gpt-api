@@ -7,7 +7,7 @@ import json
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.1.0",
+    version="5.2.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, and Data APIs"
 )
 
@@ -220,6 +220,9 @@ def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
         "isGameMarket": is_game_market(m),
         "isFuturesMarket": is_futures_market(m),
         "isMoneyline": is_moneyline_market(m),
+        "isLive": m.get("isLive"),
+        "isToday": m.get("isToday"),
+        "impliedProbGap": m.get("impliedProbGap"),
     }
 
 
@@ -562,10 +565,7 @@ async def public_search(
 
 
 async def fetch_all_active_events(max_pages: int = 5) -> List[Dict[str, Any]]:
-    """
-    Fetches all active events from Gamma /events endpoint with pagination.
-    Filters by slug prefix to identify sports game events.
-    """
+    """Fetches all active events from Gamma /events endpoint with pagination."""
     all_events: List[Dict[str, Any]] = []
     limit = 100
     offset = 0
@@ -595,12 +595,54 @@ async def fetch_all_active_events(max_pages: int = 5) -> List[Dict[str, Any]]:
     return all_events
 
 
+def parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def game_is_live(event: Dict[str, Any]) -> bool:
+    """True if the game has started but not yet ended."""
+    now   = datetime.now(timezone.utc)
+    start = parse_dt(event.get("startDate") or event.get("startDateIso"))
+    end   = parse_dt(event.get("endDate")   or event.get("endDateIso"))
+    if start and end:
+        return start <= now <= end
+    if start:
+        return start <= now
+    return False
+
+
+def game_is_today(event: Dict[str, Any]) -> bool:
+    """True if game starts today UTC."""
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    start = event.get("startDate") or event.get("startDateIso") or ""
+    return str(start)[:10] == today_str
+
+
+def compute_implied_prob_gap(prices: List[Any]) -> Optional[float]:
+    """
+    Returns the gap between sum of implied probs and 1.0.
+    Positive = juice. Negative = possible pricing error / opportunity.
+    """
+    try:
+        total = sum(float(p) for p in prices if p is not None)
+        return round(total - 1.0, 4)
+    except Exception:
+        return None
+
+
 def event_to_markets(event: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Extract and enrich markets from an event object."""
     markets = []
     event_slug  = event.get("slug", "")
     event_title = event.get("title", "")
     event_cat   = event.get("category", "")
+    is_live     = game_is_live(event)
+    is_today    = game_is_today(event)
 
     for m in event.get("markets", []):
         if not is_tradeable(m):
@@ -615,6 +657,15 @@ def event_to_markets(event: Dict[str, Any]) -> List[Dict[str, Any]]:
             m["liquidity"] = event.get("liquidity")
         if not m.get("volume") and not m.get("volumeNum"):
             m["volume"] = event.get("volume")
+        if not m.get("startDate"):
+            m["startDate"] = event.get("startDate")
+        # Inject live/today flags from event
+        m["isLive"]  = is_live
+        m["isToday"] = is_today
+        # Compute implied prob gap
+        prices = parse_possible_json(m.get("outcomePrices"))
+        if isinstance(prices, list) and len(prices) >= 2:
+            m["impliedProbGap"] = compute_implied_prob_gap(prices)
         markets.append(m)
 
     return markets
@@ -624,39 +675,53 @@ def event_to_markets(event: Dict[str, Any]) -> List[Dict[str, Any]]:
 async def live_games(
     sport: Optional[str] = Query(default=None, description="Filter by sport: nba, nhl, mlb, nfl, cbb, mls, epl, ucl, ufc, soccer. Leave empty for all."),
     moneyline_only: bool = Query(default=False, description="Return only moneyline/winner markets"),
+    live_only: bool = Query(default=False, description="Return only games currently in progress"),
     limit: int = Query(default=100, ge=1, le=500)
 ):
     """
-    Returns every active game market on Polymarket right now.
+    Returns every active game market on Polymarket for today.
     Hits the Gamma /events endpoint directly and filters by confirmed slug prefixes.
-    No team names needed. No search engine dependency.
-    Use this as the first call in any board scan.
+    Filters to today's date only — no tomorrow's slate.
+    Each market includes isLive, isToday, and impliedProbGap fields.
     """
-    # Determine which prefixes to filter by
     if sport and sport.lower() != "all":
         prefixes = SLUG_PREFIXES.get(sport.lower(), [sport.lower() + "-"])
     else:
         prefixes = ALL_SPORT_PREFIXES
 
-    # Fetch all active events
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     all_events = await fetch_all_active_events(max_pages=5)
 
     seen_ids: set = set()
     all_markets: List[Dict[str, Any]] = []
 
     for event in all_events:
-        event_slug = (event.get("slug") or "").lower()
+        event_slug  = (event.get("slug") or "").lower()
+        event_start = str(event.get("startDate") or event.get("startDateIso") or "")[:10]
+
+        # Only today's games
+        if event_start and event_start > today_str:
+            continue
+
+        # Skip events that ended more than 2 hours ago
+        end = parse_dt(event.get("endDate") or event.get("endDateIso"))
+        if end:
+            hours_since_end = (datetime.now(timezone.utc) - end).total_seconds() / 3600
+            if hours_since_end > 2:
+                continue
 
         # Filter by slug prefix
         if not any(event_slug.startswith(p) for p in prefixes):
             continue
 
-        # Skip futures events
+        # Skip futures
         if is_futures_market(event):
             continue
 
         for m in event_to_markets(event):
             if is_futures_market(m):
+                continue
+            if live_only and not m.get("isLive"):
                 continue
             mid = str(m.get("id") or m.get("slug") or "")
             if mid and mid not in seen_ids:
@@ -669,10 +734,11 @@ async def live_games(
     all_markets.sort(key=liquidity_key, reverse=True)
 
     return {
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "date": today_str,
         "sport": sport or "all",
         "prefixes_searched": prefixes,
         "total_events_scanned": len(all_events),
+        "live_only": live_only,
         "moneyline_only": moneyline_only,
         "count": len(all_markets[:limit]),
         "markets": [normalize_market(m) for m in all_markets[:limit]]
@@ -1009,6 +1075,156 @@ async def best_opportunities(
         "count": len(ranked),
         "message": "Top active markets ranked by liquidity and volume",
         "opportunities": ranked
+    }
+
+
+# ─────────────────────────────────────────
+# MOMENTUM ENDPOINT
+# ─────────────────────────────────────────
+
+@app.get("/momentum")
+async def momentum(
+    token_id: str = Query(...),
+    interval: str = Query(default="6h", description="1m, 5m, 1h, 6h, 1d"),
+    fidelity: int = Query(default=20)
+):
+    """
+    Returns a simple momentum signal for a token: rising, falling, or stable.
+    Includes magnitude and recent price history so ChatGPT doesn't have to interpret raw data.
+    """
+    history = await fetch_json(
+        CLOB_BASE, "/prices-history",
+        params={"market": token_id, "interval": interval, "fidelity": fidelity}
+    )
+
+    prices = []
+    try:
+        history_data = history.get("history") or history
+        if isinstance(history_data, list):
+            prices = [float(p.get("p") or p.get("price") or 0) for p in history_data if p]
+    except Exception:
+        pass
+
+    if len(prices) < 2:
+        return {
+            "token_id": token_id,
+            "signal": "unknown",
+            "magnitude": None,
+            "first_price": None,
+            "last_price": None,
+            "raw_count": len(prices)
+        }
+
+    first = prices[0]
+    last  = prices[-1]
+    mid   = prices[len(prices) // 2]
+    change = last - first
+    magnitude = round(abs(change), 4)
+
+    if abs(change) < 0.02:
+        signal = "stable"
+    elif change > 0:
+        # Check if it's accelerating (second half bigger move than first)
+        signal = "rising_fast" if (last - mid) > (mid - first) else "rising"
+    else:
+        signal = "falling_fast" if (mid - last) > (first - mid) else "falling"
+
+    return {
+        "token_id": token_id,
+        "interval": interval,
+        "signal": signal,
+        "magnitude": magnitude,
+        "change": round(change, 4),
+        "first_price": round(first, 4),
+        "last_price": round(last, 4),
+        "price_history": [round(p, 4) for p in prices]
+    }
+
+
+# ─────────────────────────────────────────
+# ESPN GAME STATE ENDPOINT
+# ─────────────────────────────────────────
+
+ESPN_SPORT_MAP = {
+    "nba":  ("basketball", "nba"),
+    "nfl":  ("football", "nfl"),
+    "mlb":  ("baseball", "mlb"),
+    "nhl":  ("hockey", "nhl"),
+    "cbb":  ("basketball", "mens-college-basketball"),
+    "ncaab": ("basketball", "mens-college-basketball"),
+    "mls":  ("soccer", "usa.1"),
+    "epl":  ("soccer", "eng.1"),
+    "ucl":  ("soccer", "uefa.champions"),
+}
+
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
+
+
+@app.get("/game-state")
+async def game_state(
+    sport: str = Query(..., description="nba, nfl, mlb, nhl, cbb, mls, epl, ucl"),
+    team: Optional[str] = Query(default=None, description="Filter by team name")
+):
+    """
+    Returns live scores and game clocks from ESPN for the given sport.
+    No API key needed. Use this instead of web search for live scores.
+    Much faster and more reliable than web search during live games.
+    """
+    sport_key = sport.lower()
+    if sport_key not in ESPN_SPORT_MAP:
+        raise HTTPException(status_code=400, detail=f"Sport not supported. Use: {list(ESPN_SPORT_MAP.keys())}")
+
+    sport_path, league = ESPN_SPORT_MAP[sport_key]
+    url_path = f"/{sport_path}/{league}/scoreboard"
+
+    try:
+        data = await fetch_json(ESPN_BASE, url_path, params={})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ESPN API error: {str(e)}")
+
+    events = data.get("events") or []
+    games = []
+
+    for event in events:
+        status = event.get("status", {})
+        competitions = event.get("competitions", [{}])
+        comp = competitions[0] if competitions else {}
+        competitors = comp.get("competitors", [])
+
+        home = next((c for c in competitors if c.get("homeAway") == "home"), {})
+        away = next((c for c in competitors if c.get("homeAway") == "away"), {})
+
+        home_team = home.get("team", {}).get("displayName", "")
+        away_team = away.get("team", {}).get("displayName", "")
+        home_score = home.get("score", "")
+        away_score = away.get("score", "")
+
+        if team and team.lower() not in home_team.lower() and team.lower() not in away_team.lower():
+            continue
+
+        game_info = {
+            "id": event.get("id"),
+            "name": event.get("name"),
+            "status": status.get("type", {}).get("description", ""),
+            "clock": status.get("displayClock", ""),
+            "period": status.get("period", ""),
+            "isLive": status.get("type", {}).get("state", "") == "in",
+            "isCompleted": status.get("type", {}).get("completed", False),
+            "home_team": home_team,
+            "away_team": away_team,
+            "home_score": home_score,
+            "away_score": away_score,
+            "score_display": f"{away_team} {away_score} - {home_score} {home_team}",
+        }
+        games.append(game_info)
+
+    live_games_count = sum(1 for g in games if g["isLive"])
+
+    return {
+        "sport": sport,
+        "total_games": len(games),
+        "live_games": live_games_count,
+        "games": games
     }
 
 
