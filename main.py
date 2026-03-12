@@ -642,6 +642,24 @@ async def find_game(
     }
 
 
+@app.get("/find-slug")
+async def find_slug(
+    team1: str = Query(...),
+    team2: str = Query(...),
+    sport: str = Query(default="nba")
+):
+    """Find the actual Polymarket slug for a game — use this before scanMarket."""
+    found = await find_game(team1=team1, team2=team2, sport=sport, limit=5)
+    slugs = [m["slug"] for m in found["markets"] if m.get("slug")]
+    return {
+        "team1": team1,
+        "team2": team2,
+        "sport": sport,
+        "slugs": slugs,
+        "markets": found["markets"]
+    }
+
+
 @app.get("/market-details")
 async def market_details(
     id: Optional[str] = Query(default=None),
@@ -708,9 +726,10 @@ async def market_summary(
         first_token = token_ids[0]
         try:
             pricing = {
-                "price":    await fetch_json(CLOB_BASE, "/price",    params={"token_id": first_token}),
-                "midpoint": await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": first_token}),
-                "spread":   await fetch_json(CLOB_BASE, "/spread",   params={"token_id": first_token}),
+                "price_buy":  await fetch_json(CLOB_BASE, "/price", params={"token_id": first_token, "side": "BUY"}),
+                "price_sell": await fetch_json(CLOB_BASE, "/price", params={"token_id": first_token, "side": "SELL"}),
+                "midpoint":   await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": first_token}),
+                "spread":     await fetch_json(CLOB_BASE, "/spread",   params={"token_id": first_token}),
             }
         except Exception as e:
             pricing = {"error": str(e)}
@@ -736,16 +755,18 @@ async def scan_market(
     for i, token_id in enumerate(token_ids):
         label = outcomes[i] if i < len(outcomes) else f"Token {i}"
         try:
-            price    = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id})
-            midpoint = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
-            spread   = await fetch_json(CLOB_BASE, "/spread",   params={"token_id": token_id})
-            book     = await fetch_json(CLOB_BASE, "/book",     params={"token_id": token_id})
+            price_buy  = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id, "side": "BUY"})
+            price_sell = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id, "side": "SELL"})
+            midpoint   = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
+            spread     = await fetch_json(CLOB_BASE, "/spread",   params={"token_id": token_id})
+            book       = await fetch_json(CLOB_BASE, "/book",     params={"token_id": token_id})
             all_pricing.append({
-                "outcome":  label,
-                "token_id": token_id,
-                "price":    price,
-                "midpoint": midpoint,
-                "spread":   spread,
+                "outcome":    label,
+                "token_id":   token_id,
+                "price_buy":  price_buy,
+                "price_sell": price_sell,
+                "midpoint":   midpoint,
+                "spread":     spread,
                 "book_summary": {
                     "best_bid":  book.get("bids", [{}])[0] if book.get("bids") else None,
                     "best_ask":  book.get("asks", [{}])[0] if book.get("asks") else None,
@@ -795,20 +816,26 @@ async def best_opportunities(
 # ─────────────────────────────────────────
 
 @app.get("/clob/price")
-async def clob_price(token_id: str = Query(...)):
-    return await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id})
+async def clob_price(
+    token_id: str = Query(...),
+    side: str = Query(default="BUY", description="BUY or SELL")
+):
+    return await fetch_json(CLOB_BASE, "/price", params={"token_id": token_id, "side": side})
 
 
 @app.get("/clob/prices")
-async def clob_prices(token_ids: str = Query(..., description="Comma-separated token ids")):
+async def clob_prices(
+    token_ids: str = Query(..., description="Comma-separated token ids"),
+    side: str = Query(default="BUY", description="BUY or SELL")
+):
     ids = [t.strip() for t in token_ids.split(",") if t.strip()]
     results = {}
     for tid in ids:
         try:
-            results[tid] = await fetch_json(CLOB_BASE, "/price", params={"token_id": tid})
+            results[tid] = await fetch_json(CLOB_BASE, "/price", params={"token_id": tid, "side": side})
         except Exception as e:
             results[tid] = {"error": str(e)}
-    return {"token_ids": ids, "prices": results}
+    return {"token_ids": ids, "side": side, "prices": results}
 
 
 @app.get("/clob/book")
@@ -838,10 +865,17 @@ async def clob_history(
 
 @app.get("/price-check")
 async def price_check(token_id: str = Query(...)):
-    price    = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id})
-    midpoint = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
-    spread   = await fetch_json(CLOB_BASE, "/spread",   params={"token_id": token_id})
-    return {"token_id": token_id, "price": price, "midpoint": midpoint, "spread": spread}
+    price_buy  = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id, "side": "BUY"})
+    price_sell = await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_id, "side": "SELL"})
+    midpoint   = await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_id})
+    spread     = await fetch_json(CLOB_BASE, "/spread",   params={"token_id": token_id})
+    return {
+        "token_id":   token_id,
+        "price_buy":  price_buy,
+        "price_sell": price_sell,
+        "midpoint":   midpoint,
+        "spread":     spread
+    }
 
 
 # ─────────────────────────────────────────
