@@ -561,43 +561,107 @@ async def public_search(
     )
 
 
+async def fetch_all_active_events(max_pages: int = 5) -> List[Dict[str, Any]]:
+    """
+    Fetches all active events from Gamma /events endpoint with pagination.
+    Filters by slug prefix to identify sports game events.
+    """
+    all_events: List[Dict[str, Any]] = []
+    limit = 100
+    offset = 0
+
+    for _ in range(max_pages):
+        try:
+            page = await fetch_json(
+                GAMMA_BASE, "/events",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "limit": limit,
+                    "offset": offset,
+                    "order": "startDate",
+                    "ascending": "false",
+                }
+            )
+            if not isinstance(page, list) or len(page) == 0:
+                break
+            all_events.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+        except Exception:
+            break
+
+    return all_events
+
+
+def event_to_markets(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract and enrich markets from an event object."""
+    markets = []
+    event_slug  = event.get("slug", "")
+    event_title = event.get("title", "")
+    event_cat   = event.get("category", "")
+
+    for m in event.get("markets", []):
+        if not is_tradeable(m):
+            continue
+        if not m.get("eventSlug"):
+            m["eventSlug"] = event_slug
+        if not m.get("eventTitle"):
+            m["eventTitle"] = event_title
+        if not m.get("category"):
+            m["category"] = event_cat
+        if not m.get("liquidity") and not m.get("liquidityNum"):
+            m["liquidity"] = event.get("liquidity")
+        if not m.get("volume") and not m.get("volumeNum"):
+            m["volume"] = event.get("volume")
+        markets.append(m)
+
+    return markets
+
+
 @app.get("/live-games")
 async def live_games(
     sport: Optional[str] = Query(default=None, description="Filter by sport: nba, nhl, mlb, nfl, cbb, mls, epl, ucl, ufc, soccer. Leave empty for all."),
     moneyline_only: bool = Query(default=False, description="Return only moneyline/winner markets"),
-    limit: int = Query(default=50, ge=1, le=200)
+    limit: int = Query(default=100, ge=1, le=500)
 ):
     """
     Returns every active game market on Polymarket right now.
-    Searches by confirmed slug prefixes (nba-, nhl-, cbb-, epl-, ucl-, mls-, ufc-, etc.)
-    No team names needed. Use this as the first call in any board scan.
+    Hits the Gamma /events endpoint directly and filters by confirmed slug prefixes.
+    No team names needed. No search engine dependency.
+    Use this as the first call in any board scan.
     """
-    # Determine which prefixes to search
+    # Determine which prefixes to filter by
     if sport and sport.lower() != "all":
         prefixes = SLUG_PREFIXES.get(sport.lower(), [sport.lower() + "-"])
     else:
         prefixes = ALL_SPORT_PREFIXES
 
+    # Fetch all active events
+    all_events = await fetch_all_active_events(max_pages=5)
+
     seen_ids: set = set()
     all_markets: List[Dict[str, Any]] = []
 
-    for prefix in prefixes:
-        try:
-            search_res = await public_search(
-                q=prefix, limit_per_type=50, page=1, events_status="active"
-            )
-            for m in extract_markets_from_search(
-                search_res,
-                game_markets_only=True,
-                exclude_futures=True,
-                slug_prefixes=[prefix]
-            ):
-                mid = str(m.get("id") or m.get("slug") or "")
-                if mid and mid not in seen_ids:
-                    seen_ids.add(mid)
-                    all_markets.append(m)
-        except Exception:
+    for event in all_events:
+        event_slug = (event.get("slug") or "").lower()
+
+        # Filter by slug prefix
+        if not any(event_slug.startswith(p) for p in prefixes):
             continue
+
+        # Skip futures events
+        if is_futures_market(event):
+            continue
+
+        for m in event_to_markets(event):
+            if is_futures_market(m):
+                continue
+            mid = str(m.get("id") or m.get("slug") or "")
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                all_markets.append(m)
 
     if moneyline_only:
         all_markets = [m for m in all_markets if is_moneyline_market(m)]
@@ -608,6 +672,7 @@ async def live_games(
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "sport": sport or "all",
         "prefixes_searched": prefixes,
+        "total_events_scanned": len(all_events),
         "moneyline_only": moneyline_only,
         "count": len(all_markets[:limit]),
         "markets": [normalize_market(m) for m in all_markets[:limit]]
