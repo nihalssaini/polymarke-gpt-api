@@ -595,6 +595,52 @@ async def fetch_all_active_events(max_pages: int = 5) -> List[Dict[str, Any]]:
     return all_events
 
 
+async def fetch_active_markets_by_prefix(prefixes: List[str], max_pages: int = 5) -> List[Dict[str, Any]]:
+    """
+    Fetches active markets directly from /markets endpoint filtered by slug prefix.
+    This is more reliable than /events for finding live in-progress games.
+    Official Polymarket agents repo uses /markets with active=True directly.
+    """
+    all_markets: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+    limit = 100
+
+    for _ in range(max_pages):
+        offset = len(all_markets)
+        try:
+            page = await fetch_json(
+                GAMMA_BASE, "/markets",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "limit": limit,
+                    "offset": offset,
+                    "order": "volume24hr",
+                    "ascending": "false",
+                }
+            )
+            if not isinstance(page, list) or len(page) == 0:
+                break
+            added = 0
+            for m in page:
+                slug = (m.get("slug") or "").lower()
+                if not any(slug.startswith(p) for p in prefixes):
+                    continue
+                if not is_tradeable(m):
+                    continue
+                mid = str(m.get("id") or slug)
+                if mid not in seen_ids:
+                    seen_ids.add(mid)
+                    all_markets.append(m)
+                    added += 1
+            if len(page) < limit:
+                break
+        except Exception:
+            break
+
+    return all_markets
+
+
 def parse_dt(dt_str: Optional[str]) -> Optional[datetime]:
     if not dt_str:
         return None
@@ -680,9 +726,8 @@ async def live_games(
 ):
     """
     Returns every active game market on Polymarket for today.
-    Hits the Gamma /events endpoint directly and filters by confirmed slug prefixes.
-    Filters to today's date only — no tomorrow's slate.
-    Each market includes isLive, isToday, and impliedProbGap fields.
+    Uses BOTH /markets (for live in-progress games) and /events (for today's full slate)
+    filtered by confirmed slug prefixes. Today-only filter applied.
     """
     if sport and sport.lower() != "all":
         prefixes = SLUG_PREFIXES.get(sport.lower(), [sport.lower() + "-"])
@@ -690,11 +735,34 @@ async def live_games(
         prefixes = ALL_SPORT_PREFIXES
 
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    all_events = await fetch_all_active_events(max_pages=5)
-
     seen_ids: set = set()
     all_markets: List[Dict[str, Any]] = []
 
+    # SOURCE 1: /markets endpoint — best for live in-progress games
+    direct_markets = await fetch_active_markets_by_prefix(prefixes, max_pages=10)
+    for m in direct_markets:
+        slug = (m.get("slug") or "").lower()
+        # Today filter — slug ends with today's date
+        if today_str.replace("-", "") not in slug and today_str not in slug:
+            # Also allow if endDate is today or in near future
+            end = parse_dt(m.get("endDate") or m.get("endDateIso"))
+            if end and end.strftime("%Y-%m-%d") < today_str:
+                continue
+        if is_futures_market(m):
+            continue
+        mid = str(m.get("id") or m.get("slug") or "")
+        if mid and mid not in seen_ids:
+            seen_ids.add(mid)
+            # Mark as potentially live if no startDate info
+            m["isLive"]  = True  # /markets only returns active markets so they're tradeable now
+            m["isToday"] = True
+            prices = parse_possible_json(m.get("outcomePrices"))
+            if isinstance(prices, list) and len(prices) >= 2:
+                m["impliedProbGap"] = compute_implied_prob_gap(prices)
+            all_markets.append(m)
+
+    # SOURCE 2: /events endpoint — for today's full slate including upcoming
+    all_events = await fetch_all_active_events(max_pages=5)
     for event in all_events:
         event_slug  = (event.get("slug") or "").lower()
         event_start = str(event.get("startDate") or event.get("startDateIso") or "")[:10]
@@ -710,11 +778,9 @@ async def live_games(
             if hours_since_end > 2:
                 continue
 
-        # Filter by slug prefix
         if not any(event_slug.startswith(p) for p in prefixes):
             continue
 
-        # Skip futures
         if is_futures_market(event):
             continue
 
@@ -737,7 +803,6 @@ async def live_games(
         "date": today_str,
         "sport": sport or "all",
         "prefixes_searched": prefixes,
-        "total_events_scanned": len(all_events),
         "live_only": live_only,
         "moneyline_only": moneyline_only,
         "count": len(all_markets[:limit]),
