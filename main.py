@@ -8,7 +8,7 @@ import re
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.5.0",
+    version="5.6.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, Data APIs, and ESPN public endpoints"
 )
 
@@ -385,6 +385,24 @@ def extreme_price_penalty(m: Dict[str, Any]) -> float:
     return 0.0
 
 
+def market_quality_score(m: Dict[str, Any]) -> str:
+    """
+    Tags market with quality tier based on liquidity.
+    high   = $100K+   — major NBA/NHL game, fully tradeable
+    medium = $10K-$100K — solid market, tradeable with care
+    low    = $1K-$10K  — thin, treat with caution
+    thin   = under $1K  — avoid unless specific reason
+    """
+    liq = liquidity_key(m)
+    if liq >= 100_000:
+        return "high"
+    if liq >= 10_000:
+        return "medium"
+    if liq >= 1_000:
+        return "low"
+    return "thin"
+
+
 def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
     nm = dict(m)
 
@@ -407,6 +425,10 @@ def normalize_market(m: Dict[str, Any]) -> Dict[str, Any]:
     nm["isMoneyline"] = is_moneyline_market(nm)
     nm["liquidityNum"] = liquidity_key(nm)
     nm["volumeNum"] = volume_key(nm)
+    nm["marketQuality"] = market_quality_score(nm)
+    # These get filled in by external verification — default false
+    nm["verificationComplete"] = False
+    nm["externalFairPrice"] = None
 
     return nm
 
@@ -1038,9 +1060,21 @@ async def scan_market(
             result["outcome"] = outcomes[idx]
         all_pricing.append(result)
 
+    quality = chosen_market.get("marketQuality") or market_quality_score(chosen_market)
+
     return {
         "market": chosen_market,
         "clob_pricing": all_pricing,
+        "marketQuality": quality,
+        "verificationComplete": False,
+        "verificationRequired": [
+            "injury_status_both_teams" if chosen_market.get("isGameMarket") else "event_context",
+            "vegas_line" if chosen_market.get("isGameMarket") else "external_consensus",
+            "live_score_and_clock" if chosen_market.get("isGameMarket") else "macro_context",
+        ],
+        "warning": "thin_market_low_confidence" if quality == "thin" else (
+            "low_liquidity_trade_with_caution" if quality == "low" else None
+        ),
     }
 
 
@@ -1051,6 +1085,8 @@ async def best_opportunities(
     limit: int = Query(default=5, ge=1, le=20),
     min_price: float = Query(default=0.10, ge=0.0, le=0.5),
     max_price: float = Query(default=0.90, ge=0.5, le=1.0),
+    min_liquidity: float = Query(default=5000.0, ge=0.0, description="Minimum liquidity threshold. Default 5000 filters out thin markets."),
+    include_thin: bool = Query(default=False, description="Include thin markets under $1K liquidity. Default false."),
 ):
     data = await markets(category=category, sport=sport, search=None, limit=200)
     items = data["markets"]
@@ -1060,9 +1096,19 @@ async def best_opportunities(
         p = yes_price_from_market(m)
         if p is not None and (p > max_price or p < min_price):
             continue
+        liq = liquidity_key(m)
+        if not include_thin and liq < 1000:
+            continue
+        if liq < min_liquidity:
+            continue
         filtered.append(m)
 
     ranked = sorted(filtered, key=lambda m: (liquidity_key(m), volume_key(m)), reverse=True)[:limit]
+
+    # Tag each with quality
+    for m in ranked:
+        if "marketQuality" not in m:
+            m["marketQuality"] = market_quality_score(m)
 
     return {
         "category": category,
@@ -1070,8 +1116,9 @@ async def best_opportunities(
         "limit": limit,
         "min_price": min_price,
         "max_price": max_price,
+        "min_liquidity": min_liquidity,
         "count": len(ranked),
-        "message": "Top active markets ranked by liquidity and volume",
+        "message": "Top active markets ranked by liquidity and volume. Thin markets excluded by default.",
         "opportunities": ranked,
     }
 
