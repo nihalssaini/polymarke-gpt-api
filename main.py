@@ -741,20 +741,12 @@ async def live_games(
     # SOURCE 1: /markets endpoint — best for live in-progress games
     direct_markets = await fetch_active_markets_by_prefix(prefixes, max_pages=10)
     for m in direct_markets:
-        slug = (m.get("slug") or "").lower()
-        # Today filter — slug ends with today's date
-        if today_str.replace("-", "") not in slug and today_str not in slug:
-            # Also allow if endDate is today or in near future
-            end = parse_dt(m.get("endDate") or m.get("endDateIso"))
-            if end and end.strftime("%Y-%m-%d") < today_str:
-                continue
         if is_futures_market(m):
             continue
         mid = str(m.get("id") or m.get("slug") or "")
         if mid and mid not in seen_ids:
             seen_ids.add(mid)
-            # Mark as potentially live if no startDate info
-            m["isLive"]  = True  # /markets only returns active markets so they're tradeable now
+            m["isLive"]  = True
             m["isToday"] = True
             prices = parse_possible_json(m.get("outcomePrices"))
             if isinstance(prices, list) and len(prices) >= 2:
@@ -1290,6 +1282,119 @@ async def game_state(
         "total_games": len(games),
         "live_games": live_games_count,
         "games": games
+    }
+
+
+# ESPN team abbreviation → Polymarket slug abbreviation mapping
+ESPN_TO_POLY: Dict[str, str] = {
+    # NBA
+    "Atlanta Hawks": "atl", "Boston Celtics": "bos", "Brooklyn Nets": "bkn",
+    "Charlotte Hornets": "cha", "Chicago Bulls": "chi", "Cleveland Cavaliers": "cle",
+    "Dallas Mavericks": "dal", "Denver Nuggets": "den", "Detroit Pistons": "det",
+    "Golden State Warriors": "gsw", "Houston Rockets": "hou", "Indiana Pacers": "ind",
+    "LA Clippers": "lac", "Los Angeles Lakers": "lal", "Memphis Grizzlies": "mem",
+    "Miami Heat": "mia", "Milwaukee Bucks": "mil", "Minnesota Timberwolves": "min",
+    "New Orleans Pelicans": "no", "New York Knicks": "ny", "Oklahoma City Thunder": "okc",
+    "Orlando Magic": "orl", "Philadelphia 76ers": "phi", "Phoenix Suns": "pho",
+    "Portland Trail Blazers": "por", "Sacramento Kings": "sac", "San Antonio Spurs": "sa",
+    "Toronto Raptors": "tor", "Utah Jazz": "uta", "Washington Wizards": "wsh",
+    # NHL
+    "Anaheim Ducks": "ana", "Boston Bruins": "bos", "Buffalo Sabres": "buf",
+    "Calgary Flames": "cgy", "Carolina Hurricanes": "car", "Chicago Blackhawks": "chi",
+    "Colorado Avalanche": "col", "Columbus Blue Jackets": "cbj", "Dallas Stars": "dal",
+    "Detroit Red Wings": "det", "Edmonton Oilers": "edm", "Florida Panthers": "fla",
+    "Los Angeles Kings": "lak", "Minnesota Wild": "min", "Montreal Canadiens": "mtl",
+    "Nashville Predators": "nsh", "New Jersey Devils": "njd", "New York Islanders": "nyi",
+    "New York Rangers": "nyr", "Ottawa Senators": "ott", "Philadelphia Flyers": "phi",
+    "Pittsburgh Penguins": "pit", "San Jose Sharks": "sjs", "Seattle Kraken": "sea",
+    "St. Louis Blues": "stl", "Tampa Bay Lightning": "tb", "Toronto Maple Leafs": "tor",
+    "Vancouver Canucks": "van", "Vegas Golden Knights": "vgk", "Washington Capitals": "wsh",
+    "Winnipeg Jets": "wpg",
+}
+
+
+def build_poly_slug(sport: str, away_team: str, home_team: str, date_str: str) -> str:
+    """Build Polymarket event slug from ESPN team names."""
+    away_abbr = ESPN_TO_POLY.get(away_team, away_team.lower().split()[-1][:3])
+    home_abbr = ESPN_TO_POLY.get(home_team, home_team.lower().split()[-1][:3])
+    prefix = SLUG_PREFIXES.get(sport.lower(), [sport.lower() + "-"])[0].rstrip("-")
+    return f"{prefix}-{away_abbr}-{home_abbr}-{date_str}"
+
+
+@app.get("/live-now")
+async def live_now(
+    sport: Optional[str] = Query(default=None, description="nba, nhl, mlb, nfl, cbb, mls, epl, ucl. Leave empty for all.")
+):
+    """
+    The most reliable live game endpoint.
+    Uses ESPN as the source of truth for which games are currently in progress,
+    then fetches Polymarket prices for each live game.
+    Eliminates all date field guessing — ESPN tells us exactly what's live.
+    """
+    sports_to_check = [sport.lower()] if sport else ["nba", "nhl", "cbb", "mlb", "mls", "epl", "ucl"]
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    all_live = []
+
+    for sp in sports_to_check:
+        if sp not in ESPN_SPORT_MAP:
+            continue
+
+        try:
+            sport_path, league = ESPN_SPORT_MAP[sp]
+            data = await fetch_json(ESPN_BASE, f"/{sport_path}/{league}/scoreboard", params={})
+        except Exception:
+            continue
+
+        for event in (data.get("events") or []):
+            status = event.get("status", {})
+            state  = status.get("type", {}).get("state", "")
+            if state != "in":
+                continue  # only in-progress games
+
+            competitions = event.get("competitions", [{}])
+            comp = competitions[0] if competitions else {}
+            competitors = comp.get("competitors", [])
+
+            home = next((c for c in competitors if c.get("homeAway") == "home"), {})
+            away = next((c for c in competitors if c.get("homeAway") == "away"), {})
+
+            home_name  = home.get("team", {}).get("displayName", "")
+            away_name  = away.get("team", {}).get("displayName", "")
+            home_score = home.get("score", "")
+            away_score = away.get("score", "")
+            clock      = status.get("displayClock", "")
+            period     = status.get("period", "")
+
+            # Build the expected Polymarket slug
+            slug = build_poly_slug(sp, away_name, home_name, today_str)
+
+            # Try to fetch Polymarket market for this game
+            poly_market = None
+            try:
+                result = await find_slug(team1=away_name.split()[-1], team2=home_name.split()[-1], sport=sp)
+                if result.get("recommended_slug"):
+                    poly_market = result
+            except Exception:
+                pass
+
+            all_live.append({
+                "sport": sp,
+                "home_team": home_name,
+                "away_team": away_name,
+                "home_score": home_score,
+                "away_score": away_score,
+                "clock": clock,
+                "period": period,
+                "score_display": f"{away_name} {away_score} - {home_score} {home_name}",
+                "expected_slug": slug,
+                "polymarket": poly_market,
+            })
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "live_game_count": len(all_live),
+        "games": all_live
     }
 
 
