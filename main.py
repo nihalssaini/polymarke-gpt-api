@@ -7,7 +7,7 @@ import json
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.2.0",
+    version="5.3.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, and Data APIs"
 )
 
@@ -522,9 +522,10 @@ def root():
     return {
         "message": "Polymarket GPT API is live",
         "status": "ok",
-        "version": "5.1.0",
+        "version": "5.3.0",
         "apis": {"gamma": GAMMA_BASE, "clob": CLOB_BASE, "data": DATA_BASE},
-        "supported_sports": list(SLUG_PREFIXES.keys())
+        "supported_sports": list(SLUG_PREFIXES.keys()),
+        "pipeline": "ESPN scoreboard → direct slug → find_slug fallback → CLOB price",
     }
 
 
@@ -946,19 +947,63 @@ async def find_game(
     }
 
 
+# Normalize ESPN display names → cleaner search terms.
+# Add to this map whenever a team name causes missed matches.
+ESPN_NAME_NORMALIZE: Dict[str, str] = {
+    # CBB teams with unusual suffixes/spellings
+    "Charlotte 49ers":         "Charlotte",
+    "Saint Louis Billikens":   "Saint Louis",
+    "George Washington Colonials": "George Washington",
+    "UAB Blazers":             "UAB",
+    "UTSA Roadrunners":        "UTSA",
+    "FIU Panthers":            "FIU",
+    "FAU Owls":                "FAU",
+    "UTEP Miners":             "UTEP",
+    "UConn Huskies":           "UConn",
+    "VCU Rams":                "VCU",
+    "SMU Mustangs":            "SMU",
+    "TCU Horned Frogs":        "TCU",
+    "BYU Cougars":             "BYU",
+    "USC Trojans":             "USC",
+    "UCLA Bruins":             "UCLA",
+    "LSU Tigers":              "LSU",
+    # St. vs Saint normalization
+    "St. Louis Blues":         "St Louis",
+    "St. John's Red Storm":    "St Johns",
+    # Soccer
+    "Paris Saint-Germain":     "PSG",
+}
+
+
+def normalize_espn_name(name: str) -> str:
+    """Normalize ESPN display name for better Polymarket search matching."""
+    return ESPN_NAME_NORMALIZE.get(name, name)
+
+
 @app.get("/find-slug")
 async def find_slug(
     team1: str = Query(...),
     team2: str = Query(...),
     sport: str = Query(default="nba")
 ):
-    """Find the actual Polymarket slug for a game. Always call before scanMarket."""
-    found = await find_game(team1=team1, team2=team2, sport=sport, limit=5)
+    """
+    Find the actual Polymarket slug for a game. Always call before scanMarket.
+
+    Uses full normalized team names — NOT just the last word.
+    The old bug was: 'Charlotte 49ers'.split()[-1] == '49ers' → wrong search.
+    Now we normalize first, then search with the full name.
+    """
+    t1 = normalize_espn_name(team1)
+    t2 = normalize_espn_name(team2)
+
+    found = await find_game(team1=t1, team2=t2, sport=sport, limit=5)
     moneyline_markets = [m for m in found["markets"] if m.get("isMoneyline")]
     slugs = [m["slug"] for m in found["markets"] if m.get("slug")]
     return {
         "team1": team1,
         "team2": team2,
+        "team1_normalized": t1,
+        "team2_normalized": t2,
         "sport": sport,
         "slugs": slugs,
         "recommended_slug": moneyline_markets[0]["slug"] if moneyline_markets else (slugs[0] if slugs else None),
@@ -1326,10 +1371,17 @@ async def live_now(
     sport: Optional[str] = Query(default=None, description="nba, nhl, mlb, nfl, cbb, mls, epl, ucl. Leave empty for all.")
 ):
     """
-    The most reliable live game endpoint.
-    Uses ESPN as the source of truth for which games are currently in progress,
-    then fetches Polymarket prices for each live game.
-    Eliminates all date field guessing — ESPN tells us exactly what's live.
+    Authoritative live game endpoint.
+
+    Pipeline (strict order, no source mixing):
+      1. ESPN scoreboard  → master list of what is actually LIVE (state == "in")
+      2. build_poly_slug  → construct expected Polymarket slug from ESPN team names
+      3. market_details   → direct slug lookup (fast, no search feed)
+      4. find_slug        → fallback search only if direct lookup fails
+      5. scan_market      → price verification after market is confirmed
+
+    getGameState / liveNow feeds are NOT used for discovery here.
+    If ESPN says a game is live, it is live — period.
     """
     sports_to_check = [sport.lower()] if sport else ["nba", "nhl", "cbb", "mlb", "mls", "epl", "ucl"]
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1350,11 +1402,11 @@ async def live_now(
             status = event.get("status", {})
             state  = status.get("type", {}).get("state", "")
             if state != "in":
-                continue  # only in-progress games
+                continue  # ESPN is authoritative — only process confirmed live games
 
             competitions = event.get("competitions", [{}])
-            comp = competitions[0] if competitions else {}
-            competitors = comp.get("competitors", [])
+            comp         = competitions[0] if competitions else {}
+            competitors  = comp.get("competitors", [])
 
             home = next((c for c in competitors if c.get("homeAway") == "home"), {})
             away = next((c for c in competitors if c.get("homeAway") == "away"), {})
@@ -1366,35 +1418,85 @@ async def live_now(
             clock      = status.get("displayClock", "")
             period     = status.get("period", "")
 
-            # Build the expected Polymarket slug
-            slug = build_poly_slug(sp, away_name, home_name, today_str)
+            # ── STEP 1: Build slug from ESPN team names (ESPN_TO_POLY map)
+            expected_slug = build_poly_slug(sp, away_name, home_name, today_str)
 
-            # Try to fetch Polymarket market for this game
+            # ── Reconciliation record — tracks every verification step
+            reconciliation: Dict[str, Any] = {
+                "matchup":           f"{away_name} vs {home_name}",
+                "discovered_live":   True,
+                "discovery_source":  "espn_scoreboard",
+                "expected_slug":     expected_slug,
+                "poly_market_found": False,
+                "poly_slug":         None,
+                "price_verified":    False,
+                "decision":          "pending",
+            }
+
+            # ── STEP 2: Try direct slug lookup first (fast path)
             poly_market = None
             try:
-                result = await find_slug(team1=away_name.split()[-1], team2=home_name.split()[-1], sport=sp)
-                if result.get("recommended_slug"):
-                    poly_market = result
+                details = await market_details(slug=expected_slug)
+                poly_market = details.get("market")
+                reconciliation["poly_market_found"] = True
+                reconciliation["poly_slug"]         = expected_slug
+                reconciliation["lookup_method"]     = "direct_slug"
             except Exception:
                 pass
 
+            # ── STEP 3: Fallback — search using FULL team names (not just last word)
+            if not poly_market:
+                try:
+                    # Use full displayName so "Charlotte 49ers" searches correctly,
+                    # not just "49ers" which was the old bug.
+                    result = await find_slug(team1=away_name, team2=home_name, sport=sp)
+                    if result.get("recommended_slug"):
+                        details = await market_details(slug=result["recommended_slug"])
+                        poly_market = details.get("market")
+                        reconciliation["poly_market_found"] = True
+                        reconciliation["poly_slug"]         = result["recommended_slug"]
+                        reconciliation["lookup_method"]     = "find_slug_fallback"
+                except Exception:
+                    reconciliation["lookup_method"] = "not_found"
+
+            # ── STEP 4: Price verification (only if market found)
+            pricing = None
+            if poly_market:
+                token_ids = poly_market.get("tokenIds") or []
+                if token_ids:
+                    try:
+                        pricing = {
+                            "price_buy":  await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_ids[0], "side": "BUY"}),
+                            "price_sell": await fetch_json(CLOB_BASE, "/price",    params={"token_id": token_ids[0], "side": "SELL"}),
+                            "midpoint":   await fetch_json(CLOB_BASE, "/midpoint", params={"token_id": token_ids[0]}),
+                        }
+                        reconciliation["price_verified"] = True
+                        reconciliation["decision"]       = "market_found_and_priced"
+                    except Exception:
+                        reconciliation["decision"] = "market_found_price_unavailable"
+                else:
+                    reconciliation["decision"] = "market_found_no_token_ids"
+            else:
+                reconciliation["decision"] = "no_poly_market"
+
             all_live.append({
-                "sport": sp,
-                "home_team": home_name,
-                "away_team": away_name,
-                "home_score": home_score,
-                "away_score": away_score,
-                "clock": clock,
-                "period": period,
+                "sport":         sp,
+                "home_team":     home_name,
+                "away_team":     away_name,
+                "home_score":    home_score,
+                "away_score":    away_score,
+                "clock":         clock,
+                "period":        period,
                 "score_display": f"{away_name} {away_score} - {home_score} {home_name}",
-                "expected_slug": slug,
-                "polymarket": poly_market,
+                "polymarket":    poly_market,
+                "pricing":       pricing,
+                "reconciliation": reconciliation,
             })
 
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp":       datetime.now(timezone.utc).isoformat(),
         "live_game_count": len(all_live),
-        "games": all_live
+        "games":           all_live,
     }
 
 
