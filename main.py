@@ -8,7 +8,7 @@ import re
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.4.0",
+    version="5.5.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, Data APIs, and ESPN public endpoints"
 )
 
@@ -54,16 +54,27 @@ FUTURES_MARKET_TYPES = {
 }
 
 ESPN_SPORT_MAP = {
-    "nba": ("basketball", "nba"),
-    "nfl": ("football", "nfl"),
-    "mlb": ("baseball", "mlb"),
-    "nhl": ("hockey", "nhl"),
-    "cbb": ("basketball", "mens-college-basketball"),
+    "nba":   ("basketball", "nba"),
+    "nfl":   ("football", "nfl"),
+    "mlb":   ("baseball", "mlb"),
+    "nhl":   ("hockey", "nhl"),
+    "cbb":   ("basketball", "mens-college-basketball"),
     "ncaab": ("basketball", "mens-college-basketball"),
-    "mls": ("soccer", "usa.1"),
-    "epl": ("soccer", "eng.1"),
-    "ucl": ("soccer", "uefa.champions"),
+    "mls":   ("soccer", "usa.1"),
+    "epl":   ("soccer", "eng.1"),
+    "ucl":   ("soccer", "uefa.champions"),
+    "ufc":   ("mma", "ufc"),
+    # soccer is an umbrella — map to EPL as default scoreboard, others handled separately
 }
+
+# Canonical sport enum — used everywhere for validation
+CANONICAL_SPORTS = {"nba", "nhl", "mlb", "nfl", "cbb", "mls", "epl", "ucl", "ufc", "soccer", "all"}
+
+# Sports that have live scoreboard support
+SCOREBOARD_SPORTS = {"nba", "nhl", "mlb", "nfl", "cbb", "mls", "epl", "ucl", "ufc"}
+
+# Soccer leagues covered under "soccer" umbrella
+SOCCER_LEAGUES = ["epl", "ucl", "mls"]
 
 # Normalize ESPN display names → cleaner search terms.
 ESPN_NAME_NORMALIZE: Dict[str, str] = {
@@ -556,9 +567,19 @@ def normalize_espn_competition(event: Dict[str, Any]) -> Dict[str, Any]:
 async def fetch_espn_scoreboard_events_for_discovery(sport: str) -> List[Dict[str, Any]]:
     """
     Discovery source for live games.
-    Important CBB fix: use explicit dates + groups=50 + high limit to cover the full D-I slate.
+    CBB: uses explicit dates + groups=50 + high limit to cover full D-I slate.
+    UFC: uses MMA scoreboard.
+    soccer: fans out to EPL + UCL + MLS scoreboards and merges.
     """
     sport_key = sport.lower()
+
+    # Soccer umbrella — fan out to all soccer leagues
+    if sport_key == "soccer":
+        all_events: List[Dict[str, Any]] = []
+        for league in SOCCER_LEAGUES:
+            all_events.extend(await fetch_espn_scoreboard_events_for_discovery(league))
+        return all_events
+
     if sport_key not in ESPN_SPORT_MAP:
         return []
 
@@ -568,12 +589,13 @@ async def fetch_espn_scoreboard_events_for_discovery(sport: str) -> List[Dict[st
     if sport_key in {"cbb", "ncaab"}:
         today_yyyymmdd = datetime.now(timezone.utc).strftime("%Y%m%d")
         params = {"dates": today_yyyymmdd, "groups": 50, "limit": 500}
-    else:
-        params = {}
 
-    data = await fetch_json(ESPN_BASE, f"/{sport_path}/{league}/scoreboard", params=params)
-    events = data.get("events") or []
-    return events if isinstance(events, list) else []
+    try:
+        data = await fetch_json(ESPN_BASE, f"/{sport_path}/{league}/scoreboard", params=params)
+        events = data.get("events") or []
+        return events if isinstance(events, list) else []
+    except Exception:
+        return []
 
 
 async def fetch_all_active_events(max_pages: int = 5) -> List[Dict[str, Any]]:
@@ -746,7 +768,7 @@ def root():
     return {
         "message": "Polymarket GPT API is live",
         "status": "ok",
-        "version": "5.4.0",
+        "version": "5.5.0",
         "apis": {"gamma": GAMMA_BASE, "clob": CLOB_BASE, "data": DATA_BASE},
         "supported_sports": list(SLUG_PREFIXES.keys()),
         "pipeline": "ESPN discovery (CBB uses dates+groups=50+limit) → direct slug → find_slug fallback → CLOB price",
@@ -1230,12 +1252,20 @@ async def data_live_volume(event: Optional[str] = Query(default=None)):
 
 @app.get("/game-state")
 async def game_state(
-    sport: str = Query(..., description="nba, nfl, mlb, nhl, cbb, mls, epl, ucl"),
-    team: Optional[str] = Query(default=None, description="Filter by team name"),
+    sport: str = Query(..., description="nba, nfl, mlb, nhl, cbb, mls, epl, ucl, ufc, soccer"),
+    team: Optional[str] = Query(default=None, description="Filter by team or fighter name"),
 ):
     sport_key = sport.lower()
-    if sport_key not in ESPN_SPORT_MAP:
-        raise HTTPException(status_code=400, detail=f"Sport not supported. Use: {list(ESPN_SPORT_MAP.keys())}")
+    if sport_key not in CANONICAL_SPORTS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unsupported_sport", "sport": sport, "supported": sorted(SCOREBOARD_SPORTS)}
+        )
+    if sport_key not in SCOREBOARD_SPORTS and sport_key != "soccer":
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "no_scoreboard_for_sport", "sport": sport, "supported": sorted(SCOREBOARD_SPORTS)}
+        )
 
     try:
         events = await fetch_espn_scoreboard_events_for_discovery(sport_key)
@@ -1245,18 +1275,16 @@ async def game_state(
     games = []
     for event in events:
         game_info = normalize_espn_competition(event)
-
         if team:
             t = team.lower()
             if t not in game_info["home_team"].lower() and t not in game_info["away_team"].lower():
                 continue
-
         games.append(game_info)
 
     live_games_count = sum(1 for g in games if g["isLive"])
 
     return {
-        "sport": sport,
+        "sport": sport_key,
         "total_games": len(games),
         "live_games": live_games_count,
         "games": games,
@@ -1265,18 +1293,36 @@ async def game_state(
 
 @app.get("/live-now")
 async def live_now(
-    sport: Optional[str] = Query(default=None, description="nba, nhl, mlb, nfl, cbb, mls, epl, ucl. Leave empty for all."),
+    sport: Optional[str] = Query(default=None, description="nba, nhl, mlb, nfl, cbb, mls, epl, ucl, ufc, soccer, all. Leave empty for all."),
 ):
     """
-    Discovery endpoint for actually live games.
-    CBB fix: uses ESPN scoreboard with explicit dates+groups=50+limit=500, not the underspecified default query.
+    Most reliable live game endpoint.
+    Uses ESPN for all sports. CBB uses dates+groups=50 for full D-I coverage.
+    soccer fans out to EPL+UCL+MLS. UFC uses MMA scoreboard.
+    Returns live score, clock, period, and Polymarket market for each game.
     """
-    sports_to_check = [sport.lower()] if sport else ["nba", "nhl", "cbb", "mlb", "mls", "epl", "ucl"]
+    sport_input = (sport or "all").lower()
+
+    if sport_input not in CANONICAL_SPORTS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unsupported_sport", "sport": sport, "supported": sorted(CANONICAL_SPORTS)}
+        )
+
+    # Expand to individual sports
+    if sport_input in ("all", "soccer"):
+        if sport_input == "all":
+            sports_to_check = list(SCOREBOARD_SPORTS - {"ncaab"})
+        else:
+            sports_to_check = SOCCER_LEAGUES
+    else:
+        sports_to_check = [sport_input]
+
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     all_live = []
 
     for sp in sports_to_check:
-        if sp not in ESPN_SPORT_MAP:
+        if sp not in SCOREBOARD_SPORTS:
             continue
 
         try:
@@ -1289,24 +1335,16 @@ async def live_now(
             if not game["isLive"]:
                 continue
 
-            home_name = game["home_team"]
-            away_name = game["away_team"]
-            home_score = game["home_score"]
-            away_score = game["away_score"]
-            clock = game["clock"]
-            period = game["period"]
-
+            home_name  = game["home_team"]
+            away_name  = game["away_team"]
             expected_slug = build_poly_slug(sp, away_name, home_name, today_str)
 
             reconciliation: Dict[str, Any] = {
                 "matchup": f"{away_name} vs {home_name}",
-                "discovered_live": True,
-                "discovery_source": "espn_scoreboard_full" if sp in {"cbb", "ncaab"} else "espn_scoreboard",
                 "expected_slug": expected_slug,
                 "poly_market_found": False,
                 "poly_slug": None,
-                "price_verified": False,
-                "decision": "pending",
+                "lookup_method": "pending",
             }
 
             poly_market = None
@@ -1336,27 +1374,21 @@ async def live_now(
 
             market_summary = None
             if poly_market:
-                reconciliation["price_verified"] = True
                 try:
                     scanned = await scan_market(slug=poly_market.get("slug"))
                     market_summary = scanned
                 except Exception:
                     market_summary = {"market": poly_market, "clob_pricing": []}
 
-            if poly_market:
-                reconciliation["decision"] = "market_found"
-            else:
-                reconciliation["decision"] = "no_market_found"
-
             all_live.append({
                 "sport": sp,
                 "home_team": home_name,
                 "away_team": away_name,
-                "home_score": home_score,
-                "away_score": away_score,
-                "clock": clock,
-                "period": period,
-                "score_display": f"{away_name} {away_score} - {home_score} {home_name}",
+                "home_score": game["home_score"],
+                "away_score": game["away_score"],
+                "clock": game["clock"],
+                "period": game["period"],
+                "score_display": game["score_display"],
                 "expected_slug": expected_slug,
                 "polymarket": market_summary["market"] if market_summary and market_summary.get("market") else poly_market,
                 "pricing": market_summary.get("clob_pricing") if market_summary else [],
@@ -1365,6 +1397,7 @@ async def live_now(
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "sport": sport_input,
         "live_game_count": len(all_live),
         "games": all_live,
     }
