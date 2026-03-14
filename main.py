@@ -8,7 +8,7 @@ import re
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.8.0",
+    version="5.9.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, Data APIs, and ESPN public endpoints"
 )
 
@@ -1684,4 +1684,265 @@ async def live_games(
         "moneyline_only": moneyline_only,
         "count": len(all_markets[:limit]),
         "markets": all_markets[:limit],
+    }
+
+# ─────────────────────────────────────────
+# FULL BOARD ENDPOINT
+# ─────────────────────────────────────────
+
+async def compute_momentum_signal(token_id: str, interval: str = "6h", fidelity: int = 20) -> Dict[str, Any]:
+    """Compute momentum signal for a single token. Returns signal, magnitude, change."""
+    try:
+        history = await fetch_json(
+            CLOB_BASE, "/prices-history",
+            params={"market": token_id, "interval": interval, "fidelity": fidelity}
+        )
+        prices = []
+        history_data = history.get("history") or history
+        if isinstance(history_data, list):
+            prices = [float(p.get("p") or p.get("price") or 0) for p in history_data if p]
+
+        if len(prices) < 2:
+            return {"signal": "unknown", "magnitude": None, "change": None}
+
+        first = prices[0]
+        last  = prices[-1]
+        mid   = prices[len(prices) // 2]
+        change = last - first
+
+        if abs(change) < 0.02:
+            signal = "stable"
+        elif change > 0:
+            signal = "rising_fast" if (last - mid) > (mid - first) else "rising"
+        else:
+            signal = "falling_fast" if (mid - last) > (first - mid) else "falling"
+
+        return {
+            "signal": signal,
+            "magnitude": round(abs(change), 4),
+            "change": round(change, 4),
+            "first_price": round(first, 4),
+            "last_price": round(last, 4),
+        }
+    except Exception:
+        return {"signal": "unknown", "magnitude": None, "change": None}
+
+
+async def build_full_market_with_momentum(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a complete market payload including CLOB pricing AND momentum for every token."""
+    nm = annotate_market_time_flags(normalize_market(m))
+    token_ids = extract_token_ids(nm)
+    outcomes = parse_possible_json(nm.get("outcomes")) or []
+    market_type = classify_market_type(nm)
+    quality = nm.get("marketQuality") or market_quality_score(nm)
+
+    outcome_data = []
+    for idx, token_id in enumerate(token_ids):
+        outcome_name = outcomes[idx] if idx < len(outcomes) else f"Outcome {idx}"
+
+        # Fetch pricing and momentum concurrently
+        import asyncio
+        pricing_task = asyncio.create_task(fetch_clob_pricing_for_token(token_id))
+        momentum_task = asyncio.create_task(compute_momentum_signal(token_id))
+        pricing, mom = await asyncio.gather(pricing_task, momentum_task)
+
+        buy_price = sell_price = mid = None
+        try:
+            buy_price = float((pricing.get("price_buy") or {}).get("price", 0)) or None
+        except Exception:
+            pass
+        try:
+            sell_price = float((pricing.get("price_sell") or {}).get("price", 0)) or None
+        except Exception:
+            pass
+        try:
+            mid = float((pricing.get("midpoint") or {}).get("mid", 0)) or None
+        except Exception:
+            pass
+
+        outcome_data.append({
+            "name": outcome_name,
+            "tokenId": token_id,
+            "buyPrice": buy_price,
+            "sellPrice": sell_price,
+            "midpoint": mid,
+            "momentum": mom,
+        })
+
+    return {
+        "type": market_type,
+        "slug": nm.get("slug"),
+        "marketId": nm.get("id"),
+        "question": nm.get("question"),
+        "outcomes": outcome_data,
+        "marketQuality": quality,
+        "liquidity": nm.get("liquidityNum"),
+        "volume24hr": nm.get("volumeNum"),
+        "impliedProbGap": nm.get("impliedProbGap"),
+        "warning": "thin_market_low_confidence" if quality == "thin" else (
+            "low_liquidity_trade_with_caution" if quality == "low" else None
+        ),
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/full-board")
+async def full_board(
+    sport: Optional[str] = Query(default=None, description="Filter by sport. Leave empty for ALL live sports."),
+    include_upcoming: bool = Query(default=False, description="Also include today's upcoming games not yet live."),
+    min_liquidity: float = Query(default=1000.0, description="Minimum market liquidity. Default 1000."),
+):
+    """
+    THE COMPLETE PIPELINE IN ONE CALL.
+
+    Does everything automatically so ChatGPT does not have to chain calls:
+    1. ESPN → get every live game across all sports (CBB uses groups=50 for full D-I coverage)
+    2. Polymarket → find every market for each live game (moneyline, spread, total, props)
+    3. CLOB → fetch full pricing for every outcome of every market
+    4. Momentum → compute momentum signal for every token of every outcome
+    5. Returns one unified object per game with game state + all markets + all prices + all momentum
+
+    ChatGPT should call this endpoint and then use web search ONLY for:
+    - Injuries and lineup verification
+    - Vegas line comparison
+    - News context explaining momentum signals
+
+    No chaining required. No steps to skip. Everything is in the response.
+    """
+    sport_input = (sport or "all").lower()
+    if sport_input not in CANONICAL_SPORTS:
+        raise HTTPException(status_code=400, detail={"error": "unsupported_sport", "supported": sorted(CANONICAL_SPORTS)})
+
+    if sport_input in ("all", "soccer"):
+        sports_to_check = list(SCOREBOARD_SPORTS - {"ncaab"}) if sport_input == "all" else SOCCER_LEAGUES
+    else:
+        sports_to_check = [sport_input]
+
+    snapshot_at = datetime.now(timezone.utc).isoformat()
+    today_str   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    all_games   = []
+    pipeline_errors: List[str] = []
+
+    for sp in sports_to_check:
+        if sp not in SCOREBOARD_SPORTS:
+            continue
+
+        try:
+            events = await fetch_espn_scoreboard_events_for_discovery(sp)
+        except Exception as e:
+            pipeline_errors.append(f"{sp}: ESPN scoreboard failed — {str(e)}")
+            continue
+
+        for event in events:
+            game = normalize_espn_competition(event)
+
+            # Filter: live only unless include_upcoming
+            if not game["isLive"] and not include_upcoming:
+                continue
+            if not game["isLive"] and include_upcoming:
+                # Only include today's upcoming games
+                event_date = (event.get("date") or "")[:10]
+                if event_date != today_str:
+                    continue
+
+            home_name = game["home_team"]
+            away_name = game["away_team"]
+            game_state_at = datetime.now(timezone.utc).isoformat()
+            expected_slug = build_poly_slug(sp, away_name, home_name, today_str)
+
+            # Find all markets for this game
+            poly_markets_raw: List[Dict[str, Any]] = []
+            lookup_method = "not_found"
+
+            try:
+                poly_markets_raw = await fetch_all_markets_for_event_slug(expected_slug, sp)
+                if poly_markets_raw:
+                    lookup_method = "direct_event_slug"
+            except Exception:
+                pass
+
+            if not poly_markets_raw:
+                try:
+                    result = await find_slug(team1=away_name, team2=home_name, sport=sp)
+                    if result.get("recommended_slug"):
+                        base = re.sub(r"-(moneyline|winner|spread|total|ml)$", "", result["recommended_slug"])
+                        poly_markets_raw = await fetch_all_markets_for_event_slug(base, sp)
+                        if poly_markets_raw:
+                            lookup_method = "find_slug_fallback"
+                        else:
+                            for m in result.get("markets", []):
+                                if is_tradeable(m) and not is_futures_market(m):
+                                    poly_markets_raw.append(m)
+                            if poly_markets_raw:
+                                lookup_method = "find_slug_single"
+                except Exception:
+                    pass
+
+            # Build full market payloads with momentum
+            markets_payload: List[Dict[str, Any]] = []
+            for m in poly_markets_raw:
+                if is_futures_market(m):
+                    continue
+                if liquidity_key(m) < min_liquidity:
+                    continue
+                try:
+                    payload = await build_full_market_with_momentum(m)
+                    markets_payload.append(payload)
+                except Exception as e:
+                    pipeline_errors.append(f"{sp}/{expected_slug}: market build failed — {str(e)}")
+                    continue
+
+            # Sort: moneyline first, then spread, total, props
+            type_order = {"moneyline": 0, "spread": 1, "total": 2, "prop": 3}
+            markets_payload.sort(key=lambda x: type_order.get(x.get("type", "prop"), 3))
+
+            # Build verification checklist
+            verification_required = [
+                "injury_status_both_teams",
+                "vegas_moneyline_and_spread",
+                "vegas_total_line",
+            ]
+            if any(m.get("type") == "prop" for m in markets_payload):
+                verification_required.append("player_availability_and_minutes")
+
+            all_games.append({
+                "sport": sp,
+                "game": f"{away_name} @ {home_name}",
+                "isLive": game["isLive"],
+                "status": {
+                    "period": game["period"],
+                    "clock": game["clock"],
+                    "score": {
+                        away_name: game["away_score"],
+                        home_name: game["home_score"],
+                    },
+                    "score_display": game["score_display"],
+                    "updatedAt": game_state_at,
+                },
+                "polymarket_found": len(markets_payload) > 0,
+                "lookup_method": lookup_method,
+                "expected_slug": expected_slug,
+                "market_count": len(markets_payload),
+                "markets": markets_payload,
+                "verification_required": verification_required,
+                "pipeline_complete": len(markets_payload) > 0,
+            })
+
+    # Sort games: live first, then by market count descending
+    all_games.sort(key=lambda g: (0 if g["isLive"] else 1, -g["market_count"]))
+
+    return {
+        "snapshotAt": snapshot_at,
+        "sport": sport_input,
+        "pipeline": "espn_scoreboard → polymarket_events → clob_pricing → momentum",
+        "pipeline_complete": len(pipeline_errors) == 0,
+        "pipeline_errors": pipeline_errors if pipeline_errors else None,
+        "live_game_count": sum(1 for g in all_games if g["isLive"]),
+        "total_game_count": len(all_games),
+        "games": all_games,
+        "external_verification_needed": [
+            "injuries_and_lineups_both_teams_per_game",
+            "vegas_moneyline_spread_total_per_game",
+            "news_context_for_any_rising_fast_or_falling_fast_momentum",
+        ],
     }
