@@ -8,7 +8,7 @@ import re
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.7.0",
+    version="5.8.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, Data APIs, and ESPN public endpoints"
 )
 
@@ -1353,15 +1353,144 @@ async def game_state(
     }
 
 
+async def fetch_all_markets_for_event_slug(base_slug: str, sp: str) -> List[Dict[str, Any]]:
+    """
+    Fetches ALL market types for a game event — moneyline, spread, total, props.
+    Searches Gamma /markets for any slug that starts with the base event slug.
+    Returns list of enriched market dicts.
+    """
+    found: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+
+    try:
+        # Direct event lookup first
+        event_result = await fetch_json(
+            GAMMA_BASE, "/events",
+            params={"slug": base_slug, "active": "true", "closed": "false"}
+        )
+        if isinstance(event_result, list) and event_result:
+            event = event_result[0]
+            for m in event.get("markets", []):
+                if not is_tradeable(m):
+                    continue
+                mid = str(m.get("id") or m.get("slug") or "")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    found.append(m)
+    except Exception:
+        pass
+
+    # Fallback: search /markets for slugs starting with base_slug
+    if not found:
+        try:
+            page = await fetch_json(
+                GAMMA_BASE, "/markets",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 20,
+                    "order": "volume24hr",
+                    "ascending": "false",
+                }
+            )
+            if isinstance(page, list):
+                for m in page:
+                    slug = (m.get("slug") or "").lower()
+                    if slug.startswith(base_slug.lower()) and is_tradeable(m):
+                        mid = str(m.get("id") or slug)
+                        if mid not in seen_ids:
+                            seen_ids.add(mid)
+                            found.append(m)
+        except Exception:
+            pass
+
+    return found
+
+
+def classify_market_type(m: Dict[str, Any]) -> str:
+    """Classify a market as moneyline, spread, total, or prop."""
+    smt = str(m.get("sportsMarketType") or "").lower()
+    if smt in {"moneyline", "winner", "match_winner"}:
+        return "moneyline"
+    if "spread" in smt:
+        return "spread"
+    if "total" in smt:
+        return "total"
+    blob = text_blob(m)
+    if "spread" in blob or "+1" in blob or "-1" in blob:
+        return "spread"
+    if "o/u" in blob or "over" in blob or "under" in blob or "total" in blob:
+        return "total"
+    if "prop" in blob or "player" in blob:
+        return "prop"
+    return "moneyline"
+
+
+async def build_market_payload(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a full market payload with CLOB pricing for all outcomes."""
+    nm = annotate_market_time_flags(normalize_market(m))
+    token_ids = extract_token_ids(nm)
+    outcomes = parse_possible_json(nm.get("outcomes")) or []
+    market_type = classify_market_type(nm)
+
+    outcome_prices = []
+    for idx, token_id in enumerate(token_ids):
+        pricing = await fetch_clob_pricing_for_token(token_id)
+        outcome_name = outcomes[idx] if idx < len(outcomes) else f"Outcome {idx}"
+
+        # Extract clean price values
+        buy_price = None
+        sell_price = None
+        mid = None
+        try:
+            buy_price = float((pricing.get("price_buy") or {}).get("price", 0)) or None
+        except Exception:
+            pass
+        try:
+            sell_price = float((pricing.get("price_sell") or {}).get("price", 0)) or None
+        except Exception:
+            pass
+        try:
+            mid = float((pricing.get("midpoint") or {}).get("mid", 0)) or None
+        except Exception:
+            pass
+
+        outcome_prices.append({
+            "name": outcome_name,
+            "tokenId": token_id,
+            "buyPrice": buy_price,
+            "sellPrice": sell_price,
+            "midpoint": mid,
+        })
+
+    return {
+        "type": market_type,
+        "slug": nm.get("slug"),
+        "marketId": nm.get("id"),
+        "question": nm.get("question"),
+        "outcomes": outcome_prices,
+        "marketQuality": nm.get("marketQuality"),
+        "liquidity": nm.get("liquidityNum"),
+        "volume24hr": nm.get("volumeNum"),
+        "impliedProbGap": nm.get("impliedProbGap"),
+        "isMoneyline": nm.get("isMoneyline"),
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @app.get("/live-now")
 async def live_now(
     sport: Optional[str] = Query(default=None, description="nba, nhl, mlb, nfl, cbb, mls, epl, ucl, ufc, soccer, all. Leave empty for all."),
 ):
     """
-    Most reliable live game endpoint.
-    Uses ESPN for all sports. CBB uses dates+groups=50 for full D-I coverage.
-    soccer fans out to EPL+UCL+MLS. UFC uses MMA scoreboard.
-    Returns live score, clock, period, and Polymarket market for each game.
+    Unified live game endpoint. Returns one object per live game containing:
+    - Live score + clock + period from ESPN (timestamped)
+    - ALL Polymarket market types for that game (moneyline, spread, total, props)
+    - Full CLOB pricing per outcome per market
+    - marketQuality, liquidity, timestamps on every market
+
+    This is the single source of truth for live game analysis.
+    Use web search only for injuries, Vegas lines, and news context — not for market state.
     """
     sport_input = (sport or "all").lower()
 
@@ -1371,15 +1500,12 @@ async def live_now(
             detail={"error": "unsupported_sport", "sport": sport, "supported": sorted(CANONICAL_SPORTS)}
         )
 
-    # Expand to individual sports
     if sport_input in ("all", "soccer"):
-        if sport_input == "all":
-            sports_to_check = list(SCOREBOARD_SPORTS - {"ncaab"})
-        else:
-            sports_to_check = SOCCER_LEAGUES
+        sports_to_check = list(SCOREBOARD_SPORTS - {"ncaab"}) if sport_input == "all" else SOCCER_LEAGUES
     else:
         sports_to_check = [sport_input]
 
+    snapshot_at = datetime.now(timezone.utc).isoformat()
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     all_live = []
 
@@ -1397,68 +1523,81 @@ async def live_now(
             if not game["isLive"]:
                 continue
 
-            home_name  = game["home_team"]
-            away_name  = game["away_team"]
+            home_name = game["home_team"]
+            away_name = game["away_team"]
+            game_state_at = datetime.now(timezone.utc).isoformat()
             expected_slug = build_poly_slug(sp, away_name, home_name, today_str)
 
-            reconciliation: Dict[str, Any] = {
-                "matchup": f"{away_name} vs {home_name}",
-                "expected_slug": expected_slug,
-                "poly_market_found": False,
-                "poly_slug": None,
-                "lookup_method": "pending",
-            }
+            # Find all markets for this game
+            poly_markets_raw: List[Dict[str, Any]] = []
+            lookup_method = "not_found"
 
-            poly_market = None
-
-            # Direct slug lookup first
+            # Try direct event slug lookup
             try:
-                details = await market_details(slug=expected_slug)
-                poly_market = details.get("market")
-                reconciliation["poly_market_found"] = True
-                reconciliation["poly_slug"] = expected_slug
-                reconciliation["lookup_method"] = "direct_slug"
+                poly_markets_raw = await fetch_all_markets_for_event_slug(expected_slug, sp)
+                if poly_markets_raw:
+                    lookup_method = "direct_event_slug"
             except Exception:
                 pass
 
-            # Fallback: search by full team names
-            if not poly_market:
+            # Fallback: find_slug then fetch event
+            if not poly_markets_raw:
                 try:
                     result = await find_slug(team1=away_name, team2=home_name, sport=sp)
                     if result.get("recommended_slug"):
-                        details = await market_details(slug=result["recommended_slug"])
-                        poly_market = details.get("market")
-                        reconciliation["poly_market_found"] = True
-                        reconciliation["poly_slug"] = result["recommended_slug"]
-                        reconciliation["lookup_method"] = "find_slug_fallback"
+                        found_slug = result["recommended_slug"]
+                        # Strip market suffix to get base event slug
+                        base = re.sub(r"-(moneyline|winner|spread|total|ml|winner)$", "", found_slug)
+                        poly_markets_raw = await fetch_all_markets_for_event_slug(base, sp)
+                        if poly_markets_raw:
+                            lookup_method = "find_slug_fallback"
+                        else:
+                            # Just use the single market from find_slug
+                            for m in result.get("markets", []):
+                                if is_tradeable(m):
+                                    poly_markets_raw.append(m)
+                            if poly_markets_raw:
+                                lookup_method = "find_slug_single"
                 except Exception:
-                    reconciliation["lookup_method"] = "not_found"
+                    pass
 
-            market_summary = None
-            if poly_market:
+            # Build full market payloads
+            markets_payload: List[Dict[str, Any]] = []
+            for m in poly_markets_raw:
+                if is_futures_market(m):
+                    continue
                 try:
-                    scanned = await scan_market(slug=poly_market.get("slug"))
-                    market_summary = scanned
+                    payload = await build_market_payload(m)
+                    markets_payload.append(payload)
                 except Exception:
-                    market_summary = {"market": poly_market, "clob_pricing": []}
+                    continue
+
+            # Sort: moneyline first, then spread, total, props
+            type_order = {"moneyline": 0, "spread": 1, "total": 2, "prop": 3}
+            markets_payload.sort(key=lambda x: type_order.get(x.get("type", "prop"), 3))
 
             all_live.append({
                 "sport": sp,
-                "home_team": home_name,
-                "away_team": away_name,
-                "home_score": game["home_score"],
-                "away_score": game["away_score"],
-                "clock": game["clock"],
-                "period": game["period"],
-                "score_display": game["score_display"],
+                "game": f"{away_name} @ {home_name}",
+                "status": {
+                    "period": game["period"],
+                    "clock": game["clock"],
+                    "score": {
+                        away_name: game["away_score"],
+                        home_name: game["home_score"],
+                    },
+                    "score_display": game["score_display"],
+                    "updatedAt": game_state_at,
+                },
+                "polymarket_found": len(markets_payload) > 0,
+                "lookup_method": lookup_method,
                 "expected_slug": expected_slug,
-                "polymarket": market_summary["market"] if market_summary and market_summary.get("market") else poly_market,
-                "pricing": market_summary.get("clob_pricing") if market_summary else [],
-                "reconciliation": reconciliation,
+                "markets": markets_payload,
+                "market_count": len(markets_payload),
             })
 
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "snapshotAt": snapshot_at,
         "sport": sport_input,
         "live_game_count": len(all_live),
         "games": all_live,
