@@ -8,7 +8,7 @@ import re
 
 app = FastAPI(
     title="Polymarket GPT API",
-    version="5.6.0",
+    version="5.7.0",
     description="Read-only API for Polymarket trade analysis using Gamma, CLOB, Data APIs, and ESPN public endpoints"
 )
 
@@ -115,7 +115,7 @@ ESPN_TO_POLY: Dict[str, str] = {
     "Portland Trail Blazers": "por", "Sacramento Kings": "sac", "San Antonio Spurs": "sa",
     "Toronto Raptors": "tor", "Utah Jazz": "uta", "Washington Wizards": "wsh",
 
-    # NHL
+    # NHL — verified from real Polymarket slugs
     "Anaheim Ducks": "ana", "Boston Bruins": "bos", "Buffalo Sabres": "buf",
     "Calgary Flames": "cgy", "Carolina Hurricanes": "car", "Chicago Blackhawks": "chi",
     "Colorado Avalanche": "col", "Columbus Blue Jackets": "cbj", "Dallas Stars": "dal",
@@ -125,20 +125,35 @@ ESPN_TO_POLY: Dict[str, str] = {
     "New York Rangers": "nyr", "Ottawa Senators": "ott", "Philadelphia Flyers": "phi",
     "Pittsburgh Penguins": "pit", "San Jose Sharks": "sjs", "Seattle Kraken": "sea",
     "St. Louis Blues": "stl", "Tampa Bay Lightning": "tb", "Toronto Maple Leafs": "tor",
-    "Vancouver Canucks": "van", "Vegas Golden Knights": "vgk", "Washington Capitals": "wsh",
+    "Vancouver Canucks": "van", "Vegas Golden Knights": "las", "Washington Capitals": "wsh",
     "Winnipeg Jets": "wpg",
 
-    # Some common CBB / CFB / soccer style overrides can be added as needed
-    "Ohio State Buckeyes": "ohiost",
-    "Michigan Wolverines": "mich",
-    "Kentucky Wildcats": "uk",
-    "Florida Gators": "fl",
-    "George Washington Revolutionaries": "geows",
-    "Saint Louis Billikens": "stlou",
-    "Missouri State Bears": "msrst",
-    "Louisiana Tech Bulldogs": "loutch",
-    "Charlotte 49ers": "charlt",
-    "UAB Blazers": "uab",
+    # MLB — verified from real Polymarket slugs (mlb-hou-stl, mlb-tex-col format)
+    "Arizona Diamondbacks": "ari", "Atlanta Braves": "atl", "Baltimore Orioles": "bal",
+    "Boston Red Sox": "bos", "Chicago Cubs": "chc", "Chicago White Sox": "cws",
+    "Cincinnati Reds": "cin", "Cleveland Guardians": "cle", "Colorado Rockies": "col",
+    "Detroit Tigers": "det", "Houston Astros": "hou", "Kansas City Royals": "kc",
+    "Los Angeles Angels": "laa", "Los Angeles Dodgers": "lad", "Miami Marlins": "mia",
+    "Milwaukee Brewers": "mil", "Minnesota Twins": "min", "New York Mets": "nym",
+    "New York Yankees": "nyy", "Oakland Athletics": "oak", "Philadelphia Phillies": "phi",
+    "Pittsburgh Pirates": "pit", "San Diego Padres": "sd", "San Francisco Giants": "sf",
+    "Seattle Mariners": "sea", "St. Louis Cardinals": "stl", "Tampa Bay Rays": "tb",
+    "Texas Rangers": "tex", "Toronto Blue Jays": "tor", "Washington Nationals": "wsh",
+
+    # CBB overrides
+    "Ohio State Buckeyes": "ohiost", "Michigan Wolverines": "mich",
+    "Kentucky Wildcats": "uk", "Florida Gators": "fl",
+    "George Washington Revolutionaries": "geows", "Saint Louis Billikens": "stlou",
+    "Missouri State Bears": "msrst", "Louisiana Tech Bulldogs": "loutch",
+    "Charlotte 49ers": "charlt", "UAB Blazers": "uab",
+    "Tennessee Volunteers": "tenn", "Vanderbilt Commodores": "vand",
+    "Duke Blue Devils": "duke", "North Carolina Tar Heels": "unc",
+    "Kansas Jayhawks": "kan", "Gonzaga Bulldogs": "gonz",
+    "Auburn Tigers": "aub", "Houston Cougars": "hous",
+    "Iowa State Cyclones": "iast", "Arizona Wildcats": "ariz",
+    "St. John's Red Storm": "stjohn", "Creighton Bluejays": "crei",
+    "Marquette Golden Eagles": "marq", "UConn Huskies": "uconn",
+    "Villanova Wildcats": "vill", "Xavier Musketeers": "xav",
 }
 
 STOPWORDS_FOR_SLUG = {
